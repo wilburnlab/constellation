@@ -19,8 +19,10 @@ the check rather than being shown as if it were the run.
 
 A final cluster is a round node (replayed as above), or, if the final merge
 absorbed others into it, a survivor rebuilt from the pooled reads
-(:mod:`.rebuild`): that is replayed through the rebuild's own code and checked
-against ``clusters.parquet``.
+(:mod:`.rebuild`): that is replayed through the rebuild's own code, under the
+final stage's parameters (``final_params.json``), and checked against the
+cluster's consensus. A survivor whose rebuild failed keeps its node's
+consensus and is replayed as that node, with the absorbed reads listed.
 """
 
 from __future__ import annotations
@@ -296,6 +298,29 @@ def round_params(run_dir: Path, round_index: int):
             f"params= explicitly"
         )
     return _mstep_params(em["mstep"], MStepParams), em, source
+
+
+def final_params(run_dir: Path, round_index: int):
+    """``(MStepParams, EmParams dict, source)`` the final stage ran under.
+
+    From the last round's ``final_params.json`` (written when the final stage
+    starts; ``source == "final"``). ``--resume --rounds 0`` finalizes under
+    the invoking command's parameters, so the round's own can be the wrong
+    ones for a rebuilt survivor; a run from before the record falls back to
+    them, and the source says so.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        FINAL_PARAMS,
+    )
+
+    path = Path(run_dir) / "rounds" / f"r{int(round_index):02d}" / FINAL_PARAMS
+    if path.exists():
+        em = json.loads(path.read_text())["params"]
+        return _mstep_params(em["mstep"], MStepParams), em, "final"
+    return round_params(run_dir, round_index)
 
 
 def _mstep_params(d: dict, cls):
@@ -640,11 +665,19 @@ class ClusterReplay:
 
     run_dir: Path
     cluster_id: int
-    #: ``"node"`` (a round node; ``template`` holds it) or ``"rebuilt"``.
+    #: ``"node"`` (a round node; ``template`` holds it), ``"rebuilt"`` (a
+    #: final-merge survivor re-consensused from its group's reads), or
+    #: ``"merged"`` (a survivor whose rebuild failed: its own consensus
+    #: stands, ``template`` holds its node, and the reads the merge gave it
+    #: are in ``absorbed_*`` — members of the cluster, never aligned to
+    #: that node's frame).
     kind: str
     round: int
     haplotype_id: int
     template: TemplateReplay | None = None
+    #: The cluster's node id (``cluster_nodes.parquet``'s
+    #: ``node_template_id``): what ``absorbed_from`` is measured against.
+    node_template_id: int = -1
     #: Rebuilt survivors: the consensus the reads were aligned to (the
     #: survivor node's), the pooled ConsensusResult, the members and their
     #: corpus rows, and every pooled read row.
@@ -652,11 +685,69 @@ class ClusterReplay:
     pooled: object | None = None
     member_read_row: np.ndarray | None = None
     pool_read_row: np.ndarray | None = None
+    #: Per pooled read: the node of the merge group it came from.
+    pool_node_template_id: np.ndarray | None = None
     read_ids: pa.Array | None = None
     dorado_quality: np.ndarray | None = None
+    #: ``"merged"``: the absorbed nodes' reads, the node each came from,
+    #: their ids and qualities.
+    absorbed_read_row: np.ndarray | None = None
+    absorbed_node_template_id: np.ndarray | None = None
+    absorbed_read_ids: pa.Array | None = None
+    absorbed_quality: np.ndarray | None = None
     verified: bool = False
     mismatch: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+_MASK = (1 << 40) - 1
+
+
+def _group_reads(index: RoundIndex, node_ids: list[int]) -> pa.Table:
+    """Every read of the merge-group nodes ``node_ids`` (graph ids; the low
+    40 bits are the node-order row), with the node each came from, in
+    membership order — ``(parent, haplotype, read_row)``, the order the
+    rebuild pooled them in (``rebuild._read_rows_of`` after the merge re-keyed
+    the absorbed rows onto the survivor, stable-sorted)."""
+    parts = []
+    for nid in node_ids:
+        g = int(nid) & _MASK
+        mem = index.unit_table("node_membership", int(index.node_unit[g]))
+        sel = pc.and_(
+            pc.equal(mem.column("parent_template_id"), int(index.node_parent[g])),
+            pc.equal(mem.column("haplotype_id"), int(index.node_hap[g])),
+        )
+        t = mem.filter(sel).select(["parent_template_id", "haplotype_id", "read_row"])
+        parts.append(
+            t.append_column(
+                "node_template_id", pa.array(np.full(t.num_rows, int(nid), np.int64))
+            )
+        )
+    return pa.concat_tables(parts).sort_by(
+        [
+            ("parent_template_id", "ascending"),
+            ("haplotype_id", "ascending"),
+            ("read_row", "ascending"),
+        ]
+    )
+
+
+def _read_ids_and_quality(run_dir: Path, rows: np.ndarray):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        ReadStore,
+    )
+
+    reads = ReadStore.open(Path(run_dir) / "corpus" / "reads.arrow")
+    try:
+        ids = reads.take_read_ids(rows)
+        quality = (
+            np.asarray(reads.dorado_quality, dtype=np.float64)[rows]
+            if np.asarray(reads.dorado_quality).size
+            else np.full(rows.size, np.nan)
+        )
+    finally:
+        reads.close()
+    return ids, quality
 
 
 def replay_cluster(
@@ -684,6 +775,7 @@ def replay_cluster(
     is_ours = _cluster_check(run_dir, int(cluster_id), row)
     rd = run_dir / "rounds" / f"r{int(row['round']):02d}"
     index = index or index_round(rd)
+    absorbed = [int(i) for i in (row.get("absorbed_node_template_ids") or [])]
     if not row["rebuilt"]:
         rep = replay_template(
             run_dir,
@@ -702,13 +794,35 @@ def replay_cluster(
         out = ClusterReplay(
             run_dir=run_dir,
             cluster_id=int(cluster_id),
-            kind="node",
+            kind="merged" if absorbed else "node",
             round=int(row["round"]),
             haplotype_id=int(row["haplotype_id"]),
             template=rep,
+            node_template_id=int(row["node_template_id"]),
             mismatch=mismatch,
             warnings=list(rep.warnings),
         )
+        if absorbed:
+            # The final merge gave this survivor other nodes' reads and its
+            # rebuild failed, so its own consensus stands — but the reads are
+            # the cluster's members all the same (cluster_membership.parquet
+            # holds them). Shown without them, a 34-read cluster displayed
+            # its survivor's 31.
+            group = _group_reads(index, absorbed)
+            rows = group.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+            out.absorbed_read_row = rows
+            out.absorbed_node_template_id = (
+                group.column("node_template_id").to_numpy(zero_copy_only=False)
+            )
+            out.absorbed_read_ids, out.absorbed_quality = _read_ids_and_quality(
+                run_dir, rows
+            )
+            out.warnings.append(
+                f"the final merge absorbed {len(absorbed)} node(s) ({rows.size} "
+                "reads) into this cluster and did not rebuild its consensus; "
+                "those reads are members, listed without an alignment to this "
+                "node's frame"
+            )
     else:
         out = _replay_rebuilt(run_dir, row, is_ours, params, index)
     out.verified = not out.mismatch
@@ -737,10 +851,9 @@ def _cluster_check(run_dir: Path, cluster_id: int, row: dict):
 
 def _replay_rebuilt(run_dir: Path, row: dict, is_ours, params, index: RoundIndex):
     """A final-merge survivor: its pooled reads, aligned to its node's
-    consensus and re-consensused, through the rebuild's own code."""
-    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
-        ReadStore,
-    )
+    consensus and re-consensused, through the rebuild's own code — under the
+    final stage's parameters, which ``--resume --rounds 0`` can have changed
+    from the round's."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
         pooled_node_with_consensus,
     )
@@ -750,32 +863,15 @@ def _replay_rebuilt(run_dir: Path, row: dict, is_ours, params, index: RoundIndex
 
     r = int(row["round"])
     rd = run_dir / "rounds" / f"r{r:02d}"
-    mparams, em, source = round_params(run_dir, r)
+    mparams, em, source = final_params(run_dir, r)
     if params is not None:
         mparams, source = params, "explicit"
-    mask = (1 << 40) - 1
-    survivor_row = int(row["node_template_id"]) & mask
-    group_rows = np.asarray(
-        [survivor_row] + [int(i) & mask for i in row["absorbed_node_template_ids"]],
-        dtype=np.int64,
-    )
-    group = index.nodes_at(group_rows)
-    consensus = group.column("consensus")[0].as_py()
-    survivor_parent = int(group.column("parent_template_id")[0].as_py())
-    # Every pooled read, in membership order — (parent, haplotype, read_row)
-    # — the order the rebuild pooled them in (rebuild._read_rows_of after the
-    # merge re-keyed the absorbed rows onto the survivor, stable-sorted).
-    parts = []
-    for g in group_rows.tolist():
-        mem = index.unit_table("node_membership", int(index.node_unit[g]))
-        sel = pc.and_(
-            pc.equal(mem.column("parent_template_id"), int(index.node_parent[g])),
-            pc.equal(mem.column("haplotype_id"), int(index.node_hap[g])),
-        )
-        parts.append(mem.filter(sel).select(["parent_template_id", "haplotype_id", "read_row"]))
-    pooled_rows = pa.concat_tables(parts).sort_by(
-        [("parent_template_id", "ascending"), ("haplotype_id", "ascending"), ("read_row", "ascending")]
-    )
+    survivor_id = int(row["node_template_id"])
+    node_ids = [survivor_id] + [int(i) for i in row["absorbed_node_template_ids"]]
+    survivor = index.nodes_at([survivor_id & _MASK])
+    consensus = survivor.column("consensus")[0].as_py()
+    survivor_parent = int(survivor.column("parent_template_id")[0].as_py())
+    pooled_rows = _group_reads(index, node_ids)
     pool = pooled_rows.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
     em = em or {}
     members, sampled_rows, _skipped, _fraction = rebuild_members(
@@ -804,29 +900,30 @@ def _replay_rebuilt(run_dir: Path, row: dict, is_ours, params, index: RoundIndex
     member_rows = np.asarray(
         [sampled_rows[m.member_id] for m in members], dtype=np.int64
     )
-    reads = ReadStore.open(run_dir / "corpus" / "reads.arrow")
-    try:
-        read_ids = reads.take_read_ids(pool)
-        quality = (
-            np.asarray(reads.dorado_quality, dtype=np.float64)[pool]
-            if np.asarray(reads.dorado_quality).size
-            else np.full(pool.size, np.nan)
-        )
-    finally:
-        reads.close()
+    read_ids, quality = _read_ids_and_quality(run_dir, pool)
     warnings = _library_warnings(rd)
-    if source != "round":
-        warnings.append(f"parameters from the {source}")
+    if source == "explicit":
+        warnings.append("parameters from the caller")
+    elif source != "final":
+        warnings.append(
+            f"the final stage's parameters were not recorded (a run from before "
+            f"final_params.json); replayed under the {source}'s, which a "
+            f"--resume --rounds 0 finalization may have changed"
+        )
     return ClusterReplay(
         run_dir=run_dir,
         cluster_id=int(row["cluster_id"]),
         kind="rebuilt",
         round=r,
         haplotype_id=int(row["haplotype_id"]),
+        node_template_id=survivor_id,
         frame=consensus,
         pooled=cres,
         member_read_row=member_rows,
         pool_read_row=pool,
+        pool_node_template_id=pooled_rows.column("node_template_id").to_numpy(
+            zero_copy_only=False
+        ),
         read_ids=read_ids,
         dorado_quality=quality,
         mismatch=mismatch,
@@ -844,6 +941,7 @@ __all__ = [
     "cluster_node_map",
     "replay_cluster",
     "replay_template",
+    "final_params",
     "index_round",
     "round_params",
 ]

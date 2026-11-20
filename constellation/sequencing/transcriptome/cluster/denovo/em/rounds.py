@@ -57,6 +57,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em import refine as r
 from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
     EM_ASSIGNMENT_TABLE,
     run_em_estep,
+    runner_up_measured,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
     ReadStore,
@@ -98,6 +99,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
     rebuild_survivors,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+    FINAL_PARAMS,
     read_round_membership,
     read_round_nodes,
 )
@@ -645,6 +647,16 @@ def _finish(
     _write_summary(output_dir, history + results)
     if final_nodes is not None and final_assignments is not None:
         final_rd = rounds_dir / f"r{results[-1].round_index:02d}"
+        # Before any work, as each round's own params.json: what the final
+        # merge and rebuild run under. `--resume --rounds 0` finalizes under
+        # the invoking command's parameters, which need not be the last
+        # round's, and a rebuilt survivor replayed under the round's would
+        # re-create other evidence and still verify (a member cap of 10 at
+        # finalization replayed with all 34 reads).
+        _write_json(
+            final_rd / FINAL_PARAMS,
+            _round_params_record(params, _cached_corpus_digest(corpus)),
+        )
         final_nodes, final_membership, final = _final_graph_and_merge(
             final_rd,
             final_nodes,
@@ -780,6 +792,11 @@ def _one_round(
         )
     t_estep = time.time() - t0
     _warn_on_saturation(estep_stats, params, log)
+    # Whether a null runner-up means "no rival" or "never looked": the lazy
+    # round-1 walk stops at its first admitted template.
+    estep_stats["runner_up_measured"] = runner_up_measured(
+        r, estep_aligner=params.estep_aligner, round1_rule=params.round1_rule()
+    )
 
     assignments = _read_assignments(rd / "assignments")
     if prev_assignments is not None:
@@ -1624,7 +1641,7 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
     # merged is a file a re-run that merges nothing leaves behind.
     _write_table(rd / "merged.parquet", merged)
     # This round has a successor now, so it is no longer anybody's final one.
-    for stale in ("final.json", "merged_final.parquet"):
+    for stale in ("final.json", "merged_final.parquet", FINAL_PARAMS):
         (rd / stale).unlink(missing_ok=True)
     shutil.rmtree(rd / _FINAL_GRAPH, ignore_errors=True)
     _write_json(rd / "refine.json", record)

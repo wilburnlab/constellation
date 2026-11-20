@@ -146,9 +146,10 @@ def cluster_nodes(run_dir: Path) -> pa.Table:
     return cluster_node_map(run_dir)
 
 
-def nodes(run_dir: Path, round_index: int) -> pa.Table:
-    """A round's M-step nodes, in node order."""
-    return read_round_nodes(_round_dir(run_dir, round_index))
+def nodes(run_dir: Path, round_index: int, columns: list[str] | None = None) -> pa.Table:
+    """A round's M-step nodes, in node order; ``columns`` reads only those
+    (a query for ids need not hold every consensus)."""
+    return read_round_nodes(_round_dir(run_dir, round_index), columns=columns)
 
 
 def node_membership(run_dir: Path, round_index: int) -> pa.Table:

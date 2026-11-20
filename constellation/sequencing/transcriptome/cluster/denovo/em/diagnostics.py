@@ -283,7 +283,23 @@ def section_assignment_rule(em_dir: Path) -> ReportSection:
     delta = assigned.column("logl_delta").to_numpy(zero_copy_only=False)
     overridden = np.nansum(delta > 0) if delta.size else 0
 
-    if "runner_up_template_id" in assigned.column_names:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        round_runner_up_measured,
+    )
+
+    measured = round_runner_up_measured(d)
+    if "runner_up_template_id" in assigned.column_names and not measured:
+        # The lazy round-1 walk stops at its first admitted template, so it
+        # never learns who came second: every runner-up is null, and reading
+        # null as "no rival" reported the whole round uncontested.
+        uncontested = None
+        uncontested_how = (
+            "unknown — this round's rule (round 1's lazy walk under ORF "
+            "seeding, --estep-aligner edlib / native) stops at the first "
+            "admitted template and never measures a runner-up"
+        )
+        contested = None
+    elif "runner_up_template_id" in assigned.column_names:
         # A read with no other admitted TEMPLATE is uncontested. Counting
         # admitted hits instead counted a second minimap2 hit on the winner's
         # own template as a contender.
@@ -297,7 +313,11 @@ def section_assignment_rule(em_dir: Path) -> ReportSection:
         contested = None
     body = (
         f"Round {r}, {n:,} assigned reads.\n\n"
-        f"- uncontested ({uncontested_how}): **{uncontested:.2%}**\n"
+        + (
+            f"- uncontested ({uncontested_how}): **{uncontested:.2%}**\n"
+            if uncontested is not None
+            else f"- contested / uncontested: **{uncontested_how}**\n"
+        )
         + (
             f"- contested — the runner-up's identity within the read's own "
             f"noise band of the winner's: **{contested:.2%}**\n"

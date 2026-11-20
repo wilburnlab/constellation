@@ -50,10 +50,16 @@ def evidence_params(**kw) -> EmParams:
 
 
 @pytest.fixture(scope="module")
-def runs(tmp_path_factory):
-    """``{1: out_dir, 3: out_dir}`` — the one-round and three-round runs."""
+def panel(tmp_path_factory) -> tuple[Path, Path]:
+    """``(base, demux_dir)`` the shared runs are made from."""
     base = tmp_path_factory.mktemp("em_evidence")
-    demux = three_gene_panel(base)
+    return base, three_gene_panel(base)
+
+
+@pytest.fixture(scope="module")
+def runs(panel):
+    """``{1: out_dir, 3: out_dir}`` — the one-round and three-round runs."""
+    base, demux = panel
     out = {}
     for rounds in (1, 3):
         d = base / f"em{rounds}"
@@ -921,6 +927,7 @@ def test_a_run_from_before_the_records_still_replays(runs, tmp_path):
     (old / "cluster_nodes.parquet").unlink()
     for rd in _rounds(old):
         (rd / "params.json").unlink()
+        (rd / "final_params.json").unlink(missing_ok=True)
         for key in ("templates", "disagreements", "columns", "covariance", "reads"):
             shutil.rmtree(rd / "mstep" / key, ignore_errors=True)
         record = _json(rd / "round.json")
@@ -970,6 +977,7 @@ def test_departures_rebuild_every_sampled_read_exactly(runs, split_template_id):
     is the read's allele at every PWM column."""
     from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
         member_alleles,
+        member_spans,
     )
     from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
 
@@ -977,6 +985,12 @@ def test_departures_rebuild_every_sampled_read_exactly(runs, split_template_id):
     st = R.support_tables(rep, space="frame")
     pooled = rep.result.internals.pooled
     want = member_alleles(pooled, np.arange(pooled.plan.n_columns))
+    # Inside a read's span an ambiguous base (-1 to member_alleles, "no
+    # evidence") is carried as 5, N — never left to read as the reference.
+    lo, hi = member_spans(pooled)
+    cols = np.arange(want.shape[1])
+    inside = (cols[None, :] >= lo[:, None]) & (cols[None, :] < hi[:, None])
+    want = np.where((want == -1) & inside, 5, want)
     ref = np.where(np.asarray(pooled.winner) == 5, -2, np.asarray(pooled.winner))
     reads = st.reads.to_pylist()
     deps = st.departures.to_pylist()
@@ -1188,3 +1202,237 @@ def test_replay_reads_one_unit_not_the_round(runs, monkeypatch):
     for cid in cids:
         assert R.replay_cluster(out, cid).verified
     assert len(built) == 1, "the round was indexed once and reused"
+
+
+# ── review of the evidence branch (Codex, 2026-11-19) ─────────────────
+
+_FINAL_OUTPUTS = (
+    "clusters.parquet",
+    "cluster_membership.parquet",
+    "cluster_nodes.parquet",
+    "feature_quant.parquet",
+    "cluster.fa",
+    "proteins.fasta",
+    "cluster_edges.parquet",
+    "manifest.json",
+    "_SUCCESS",
+)
+
+
+def _without_final_stage(src: Path, dst: Path) -> Path:
+    """A copy of a finished run with its final stage gone, as
+    ``--resume --rounds 0`` finds one."""
+    shutil.copytree(src, dst)
+    for name in _FINAL_OUTPUTS:
+        (dst / name).unlink(missing_ok=True)
+    last = _rounds(dst)[-1]
+    for name in ("merged_final.parquet", "final.json", "final_params.json"):
+        (last / name).unlink(missing_ok=True)
+    shutil.rmtree(last / "graph_final", ignore_errors=True)
+    return dst
+
+
+def test_a_rebuilt_survivor_is_replayed_under_the_final_stage_s_parameters(
+    runs, panel, tmp_path
+):
+    """1. ``--resume --rounds 0`` finalized with a member cap of 10, and the
+    replay — under the last round's parameters — pooled all of a survivor's
+    reads and still verified."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    _base, demux = panel
+    out = _without_final_stage(runs[1], tmp_path / "em")
+    run_em(
+        demux,
+        out,
+        params=evidence_params(rounds=0, mstep=MStepParams(max_members_per_template=10)),
+        resume=True,
+        report=False,
+    )
+    assert (out / "rounds" / "r01" / "final_params.json").exists()
+    nodes = R.cluster_nodes(out).filter(pa.compute.field("rebuilt"))
+    cids = nodes.column("cluster_id").to_pylist()
+    assert cids
+    seen_capped = False
+    for cid in cids:
+        rep = R.replay_cluster(out, cid)
+        assert rep.kind == "rebuilt" and rep.verified, (cid, rep.mismatch)
+        assert rep.member_read_row.size <= 10
+        seen_capped |= rep.pool_read_row.size > 10
+    assert seen_capped, "no rebuilt survivor pools more than the cap"
+
+
+def test_a_survivor_whose_rebuild_failed_keeps_every_member(
+    runs, panel, tmp_path, monkeypatch
+):
+    """2. The final merge gave a survivor other nodes' reads and its rebuild
+    failed: its consensus stands, its membership is still the group's, and
+    the support view showed only the survivor's own reads."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import rebuild
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    def fails(*_a, **_k):
+        raise RuntimeError("injected rebuild failure")
+
+    _base, demux = panel
+    out = _without_final_stage(runs[1], tmp_path / "em")
+    monkeypatch.setattr(rebuild, "rebuild_one", fails)
+    run_em(demux, out, params=evidence_params(rounds=0), resume=True, report=False)
+    monkeypatch.undo()
+
+    nodes = R.cluster_nodes(out)
+    merged = nodes.filter(
+        pa.compute.greater(nodes.column("n_absorbed"), 0)
+    ).to_pylist()
+    assert merged and not any(r["rebuilt"] for r in merged)
+    members = pq.read_table(out / "cluster_membership.parquet")
+    for row in merged:
+        want = members.filter(
+            pa.compute.equal(members.column("cluster_id"), row["cluster_id"])
+        ).column("read_id")
+        rep = R.replay_cluster(out, row["cluster_id"])
+        assert rep.kind == "merged" and rep.verified, rep.mismatch
+        st = R.support_tables(rep)
+        assert sorted(st.reads.column("read_id").to_pylist()) == sorted(want.to_pylist())
+        absorbed = st.reads.filter(pa.compute.is_valid(st.reads.column("absorbed_from")))
+        assert absorbed.num_rows == rep.absorbed_read_row.size > 0
+        assert set(absorbed.column("absorbed_from").to_pylist()) == set(
+            row["absorbed_node_template_ids"]
+        )
+        # Never aligned to this node's frame: listed, with no span.
+        assert absorbed.column("span_lo").null_count == absorbed.num_rows
+
+
+def test_support_tables_keep_the_cluster_s_verdict(runs):
+    """3. A cluster's check (its consensus against the cluster's) is the
+    replay's; the support tables reported the template's instead."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    nodes = R.cluster_nodes(runs[1])
+    plain = nodes.filter(
+        pa.compute.and_(
+            pa.compute.invert(nodes.column("rebuilt")),
+            pa.compute.equal(nodes.column("n_absorbed"), 0),
+        )
+    )
+    rep = R.replay_cluster(runs[1], plain.column("cluster_id")[0].as_py())
+    assert rep.kind == "node" and rep.verified
+    rep.mismatch = ["the node's consensus is not the cluster's"]
+    rep.verified = False
+    st = R.support_tables(rep)
+    assert not st.verified
+    assert st.mismatch == rep.mismatch
+
+
+def _plant_n(out: Path, read_row: int, position: int) -> None:
+    """Replace one base of one corpus read with N, in place."""
+    import os
+
+    path = out / "corpus" / "reads.arrow"
+    with pa.OSFile(str(path)) as src:
+        table = pa.ipc.open_file(src).read_all()
+    seqs = table.column("sequence").to_pylist()
+    s = seqs[read_row]
+    seqs[read_row] = s[:position] + "N" + s[position + 1 :]
+    i = table.schema.get_field_index("sequence")
+    table = table.set_column(
+        i, table.schema.field(i), pa.array(seqs, table.schema.field(i).type)
+    )
+    tmp = path.with_suffix(".tmp")
+    with pa.OSFile(str(tmp), "wb") as sink, pa.ipc.new_file(sink, table.schema) as w:
+        w.write_table(table)
+    os.replace(tmp, path)
+
+
+def test_an_ambiguous_base_inside_a_read_is_not_the_reference_s(
+    runs, tmp_path, split_template_id
+):
+    """4. An interior N is no evidence — not agreement: span + departures
+    rebuilt it as the reference's base, in both coordinate spaces."""
+    import re
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    out = tmp_path / "copy"
+    shutil.copytree(runs[1], out)
+    rep = R.replay_template(out, 1, split_template_id)
+    k = int(rep.result.member_pos[0])
+    read_row = int(rep.result.read_row[k])
+    i = rep.rows.column("read_row").to_pylist().index(read_row)
+    q = int(rep.rows.column("q_start")[i].as_py())
+    position = None
+    for n, op in re.findall(r"(\d+)([=XIDM])", rep.rows.column("cigar")[i].as_py()):
+        n = int(n)
+        if op in "=M" and n >= 9:
+            position = q + n // 2
+            break
+        if op in "=XMI":
+            q += n
+    assert position is not None
+    _plant_n(out, read_row, position)
+
+    rep = R.replay_template(out, 1, split_template_id)
+    k = rep.result.read_row.tolist().index(read_row)
+    m = rep.result.member_pos.tolist().index(k)
+    proj = rep.result.internals.pooled.projections[m][0]
+    n_cols = proj.match_fpos[proj.match_base >= 4]
+    assert n_cols.size == 1
+    for space in ("frame", "consensus"):
+        st = R.support_tables(rep, space=space)
+        idx = st.reads.column("read_row").to_pylist().index(read_row)
+        deps = st.departures.filter(pa.compute.equal(st.departures.column("read_idx"), idx))
+        assert deps.filter(pa.compute.equal(deps.column("allele"), 5)).num_rows == 1, space
+        if space == "frame":
+            at = deps.filter(pa.compute.equal(deps.column("allele"), 5))
+            assert at.column("col").to_pylist() == [int(n_cols[0])]
+
+
+def test_a_narrow_node_query_reads_no_sequence(runs, monkeypatch):
+    """5. ``columns=`` was applied after the whole table — every consensus —
+    had been read and sorted."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import round_io
+
+    seen = []
+    real = round_io.in_node_order
+
+    def spy(table):
+        seen.append(table.column_names)
+        return real(table)
+
+    monkeypatch.setattr(round_io, "in_node_order", spy)
+    rd = _rounds(runs[1])[0]
+    table = round_io.read_round_nodes(rd, columns=["parent_template_id", "n_reads"])
+    assert table.column_names == ["parent_template_id", "n_reads"]
+    assert seen and all("consensus" not in names for names in seen)
+    full = round_io.read_round_nodes(rd)
+    assert table.equals(full.select(["parent_template_id", "n_reads"]))
+
+
+def test_a_round_that_never_measured_a_runner_up_says_unknown(runs, tmp_path):
+    """6. Round 1's lazy walk (ORF seeding, native) stops at its first
+    admitted template; the report read its null runner-ups as 'no rival'
+    and called the round 0% contested."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
+        section_assignment_rule,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        round_runner_up_measured,
+    )
+
+    rd = _rounds(runs[1])[0]
+    assert _json(rd / "round.json")["estep"]["runner_up_measured"] is False
+    body = section_assignment_rule(runs[1]).body
+    assert "unknown" in body and "uncontested (no runner-up template)" not in body
+    # A round from before the record is judged by the run's E-step stamp.
+    old = tmp_path / "old"
+    shutil.copytree(runs[1], old)
+    old_rd = old / "rounds" / rd.name
+    record = _json(old_rd / "round.json")
+    record["estep"].pop("runner_up_measured")
+    (old_rd / "round.json").write_text(json.dumps(record))
+    assert round_runner_up_measured(old_rd) is False
+    # Later rounds do measure it.
+    assert all(round_runner_up_measured(d) for d in _rounds(runs[3])[1:])

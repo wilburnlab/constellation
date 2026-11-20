@@ -137,13 +137,22 @@ def read_round_nodes(rd: Path, columns: list[str] | None = None) -> pa.Table:
     """A finished round's M-step nodes, in node order, checked.
 
     The order is ``(parent_template_id, haplotype_id)``, the order the next
-    round's template ids are assigned in.
+    round's template ids are assigned in. ``columns`` are read, with the two
+    sort keys, and nothing else: projected after the read, a query for ids
+    held every consensus string (~2.7 GB at 9.4M reads) through the sort.
     """
     rd = Path(rd)
     shards = round_mstep_shards(rd, NODES_KEY)
     if not shards:
-        return REFINED_NODE_TABLE.empty_table()
-    table = in_node_order(pa_ds.dataset(shards, schema=REFINED_NODE_TABLE).to_table())
+        empty = REFINED_NODE_TABLE.empty_table()
+        return empty.select(columns) if columns else empty
+    read = None
+    if columns:
+        keys = ["parent_template_id", "haplotype_id"]
+        read = list(columns) + [k for k in keys if k not in columns]
+    table = in_node_order(
+        pa_ds.dataset(shards, schema=REFINED_NODE_TABLE).to_table(columns=read)
+    )
     record = round_record(rd)
     if "n_nodes" in record and table.num_rows != int(record["n_nodes"]):
         raise StaleShardsError(
@@ -250,7 +259,44 @@ def read_round_membership(rd: Path) -> pa.Table:
     return table
 
 
+#: The final stage's parameters, written in the last round's directory when
+#: that stage starts. ``--resume --rounds 0`` finalizes under the invoking
+#: command's parameters, which need not be the last round's (a smaller member
+#: cap, another admission floor), and a rebuilt survivor is replayed under
+#: these.
+FINAL_PARAMS = "final_params.json"
+
+
+def round_runner_up_measured(rd: Path) -> bool:
+    """Whether round ``rd``'s rule measured who came second.
+
+    ``round.json`` says (``estep.runner_up_measured``); a round from before
+    that record is judged by the run's E-step stamp (``rounds/estep.json``;
+    a stampless run is minimap2's, which always measures).
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        runner_up_measured,
+    )
+
+    rd = Path(rd)
+    said = (round_record(rd).get("estep") or {}).get("runner_up_measured")
+    if said is not None:
+        return bool(said)
+    stamp_path = rd.parent / "estep.json"
+    stamp = json.loads(stamp_path.read_text()) if stamp_path.exists() else {}
+    try:
+        round_index = int(rd.name[1:])
+    except ValueError:
+        return True
+    return runner_up_measured(
+        round_index,
+        estep_aligner=stamp.get("estep_aligner", "minimap2"),
+        round1_rule=stamp.get("round1_rule", "replication"),
+    )
+
+
 __all__ = [
+    "FINAL_PARAMS",
     "MEMBERSHIP_KEY",
     "MSTEP_DIR",
     "NODES_KEY",
@@ -265,4 +311,5 @@ __all__ = [
     "read_round_templates",
     "round_mstep_shards",
     "round_record",
+    "round_runner_up_measured",
 ]

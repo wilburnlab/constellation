@@ -24,6 +24,7 @@ split shows as blocks of reads departing together at the same columns.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -43,6 +44,10 @@ READS_SCHEMA = pa.schema(
         pa.field("read_id", pa.string(), nullable=True),
         pa.field("sample_id", pa.int64(), nullable=True),
         pa.field("node", pa.int32(), nullable=False),
+        # The node of the final merge's group this read came from, when the
+        # merge absorbed that node into the cluster; null for the survivor's
+        # own reads and for any template replay.
+        pa.field("absorbed_from", pa.int64(), nullable=True),
         # Voted in the PWM. An unsampled read (beyond max_members_per_template)
         # has no alignment here and a null span.
         pa.field("sampled", pa.bool_(), nullable=False),
@@ -68,7 +73,9 @@ DEPARTURES_SCHEMA = pa.schema(
     [
         pa.field("read_idx", pa.int32(), nullable=False),
         pa.field("col", pa.int32(), nullable=False),
-        # 0-3 = ACGT, 4 = gap (the read lacks a base the reference carries).
+        # 0-3 = ACGT, 4 = gap (the read lacks a base the reference carries),
+        # 5 = N (the read covers the column with an ambiguous base: no
+        # evidence, which is not agreement with the reference).
         pa.field("allele", pa.int8(), nullable=False),
     ]
 )
@@ -139,8 +146,11 @@ class SupportTables:
     insertions: pa.Table
     columns: pa.Table
     arcs: pa.Table
+    #: The replay's own verdict — for a cluster, the cluster's (its consensus
+    #: checked against the cluster's), not only its node's.
     verified: bool
     warnings: list[str] = field(default_factory=list)
+    mismatch: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,34 +168,92 @@ class _Source:
     template_id: int
     verified: bool
     warnings: list
+    #: The template's own reads are read_row[:n_own]; any after are the
+    #: final merge's absorbed reads, which the M-step's evidence never saw.
+    n_own: int = -1
+    #: Per read: the absorbed node it came from, -1 for none.
+    absorbed_from: np.ndarray | None = None
+    mismatch: list = field(default_factory=list)
+
+
+def _template_source(replay: TemplateReplay) -> _Source:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        round_runner_up_measured,
+    )
+
+    res = replay.result
+    internals = res.internals
+    if internals is None:
+        raise ReplayError(
+            f"template {replay.template_id}: the M-step kernel did not run on "
+            f"it (status {res.record.status}); there is no PWM to show"
+        )
+    read_row = np.asarray(res.read_row, dtype=np.int64)
+    warnings = list(replay.warnings)
+    rd = Path(replay.run_dir) / "rounds" / f"r{int(replay.round):02d}"
+    if not round_runner_up_measured(rd):
+        warnings.append(
+            "this round's rule never measured a runner-up (the lazy round-1 "
+            "walk stops at its first admitted template): a null "
+            "runner_up_template_id is unknown, not 'no rival'"
+        )
+    return _Source(
+        pooled=internals.pooled,
+        children=list(internals.children),
+        read_row=read_row,
+        node_of_read=np.asarray(res.haplotype_of_read, dtype=np.int64),
+        member_pos=np.asarray(res.member_pos, dtype=np.int64),
+        read_ids=replay.read_ids,
+        quality=np.asarray(replay.dorado_quality, dtype=np.float64),
+        display=replay.rows,
+        internals=internals,
+        record_round=replay.round,
+        template_id=replay.template_id,
+        verified=replay.verified,
+        warnings=warnings,
+        n_own=int(read_row.size),
+        absorbed_from=np.full(read_row.size, -1, dtype=np.int64),
+        mismatch=list(replay.mismatch),
+    )
 
 
 def _source(replay) -> _Source:
-    if isinstance(replay, ClusterReplay) and replay.kind == "node":
-        replay = replay.template
     if isinstance(replay, TemplateReplay):
-        res = replay.result
-        internals = res.internals
-        if internals is None:
-            raise ReplayError(
-                f"template {replay.template_id}: the M-step kernel did not run on "
-                f"it (status {res.record.status}); there is no PWM to show"
+        return _template_source(replay)
+    if isinstance(replay, ClusterReplay) and replay.kind in ("node", "merged"):
+        # The node's evidence, under the CLUSTER's verdict: the cluster check
+        # (its consensus against the cluster's) is the replay's, and a
+        # mismatch there must not come back verified from the template.
+        src = _template_source(replay.template)
+        src.verified = bool(replay.verified)
+        src.mismatch = list(replay.mismatch)
+        src.warnings = list(dict.fromkeys(list(replay.warnings) + src.warnings))
+        extra = replay.absorbed_read_row
+        if replay.kind == "merged" and extra is not None and extra.size:
+            n = int(extra.size)
+            src.read_row = np.concatenate([src.read_row, extra.astype(np.int64)])
+            src.node_of_read = np.concatenate(
+                [src.node_of_read, np.full(n, int(replay.haplotype_id), np.int64)]
             )
-        return _Source(
-            pooled=internals.pooled,
-            children=list(internals.children),
-            read_row=np.asarray(res.read_row, dtype=np.int64),
-            node_of_read=np.asarray(res.haplotype_of_read, dtype=np.int64),
-            member_pos=np.asarray(res.member_pos, dtype=np.int64),
-            read_ids=replay.read_ids,
-            quality=np.asarray(replay.dorado_quality, dtype=np.float64),
-            display=replay.rows,
-            internals=internals,
-            record_round=replay.round,
-            template_id=replay.template_id,
-            verified=replay.verified,
-            warnings=list(replay.warnings),
-        )
+            src.absorbed_from = np.concatenate(
+                [src.absorbed_from, np.asarray(replay.absorbed_node_template_id, np.int64)]
+            )
+            src.read_ids = pa.concat_arrays(
+                [
+                    pa.array(src.read_ids).cast(pa.string()),
+                    pa.array(replay.absorbed_read_ids).cast(pa.string()),
+                ]
+            )
+            src.quality = np.concatenate(
+                [src.quality, np.asarray(replay.absorbed_quality, np.float64)]
+            )
+            if src.display is not None:
+                pad = pa.table(
+                    {f.name: pa.nulls(n, f.type) for f in src.display.schema},
+                    schema=src.display.schema,
+                )
+                src.display = pa.concat_tables([src.display, pad])
+        return src
     if isinstance(replay, ClusterReplay) and replay.kind == "rebuilt":
         from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
             _support_span,
@@ -201,6 +269,11 @@ def _source(replay) -> _Source:
         # id: a survivor need not have been its parent's node 0, and asking
         # for node 0 of it raised "no node 1" (Nov2026 run, ledger #78a).
         hid = int(replay.haplotype_id)
+        from_node = (
+            np.asarray(replay.pool_node_template_id, dtype=np.int64)
+            if replay.pool_node_template_id is not None
+            else np.full(pool.size, int(replay.node_template_id), np.int64)
+        )
         return _Source(
             pooled=replay.pooled,
             children=[(hid, replay.pooled, lo, hi)],
@@ -215,6 +288,11 @@ def _source(replay) -> _Source:
             template_id=-1,
             verified=replay.verified,
             warnings=list(replay.warnings),
+            n_own=int(pool.size),
+            absorbed_from=np.where(
+                from_node != int(replay.node_template_id), from_node, -1
+            ),
+            mismatch=list(replay.mismatch),
         )
     raise TypeError(f"not a replay: {type(replay).__name__}")
 
@@ -277,6 +355,16 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
         else np.zeros((0, n_frame), dtype=np.int8)
     )
     spans_lo, spans_hi = member_spans(pooled)
+    if m_idx.size:
+        # Inside its span a read says something at every column, and an
+        # ambiguous base is "no evidence" — which member_alleles writes as
+        # -1, the same code as "uncovered". Left so, span + departures
+        # rebuilt an interior N as the reference's base: 5 keeps it an N.
+        cols = np.arange(n_frame, dtype=np.int64)
+        inside = (cols[None, :] >= spans_lo[m_idx][:, None]) & (
+            cols[None, :] < spans_hi[m_idx][:, None]
+        )
+        alleles = np.where((alleles == -1) & inside, np.int8(5), alleles)
 
     # Departures in frame space: covered, and not the reference's allele.
     ref_code = np.where(winner == 5, -2, winner)  # an N departs from everything
@@ -300,7 +388,9 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
             if length <= 0:
                 continue
             b0, bw = int(block_start[j]), int(block_width[j])
-            placed = int(((alleles[k, b0 : b0 + bw] >= 0) & (alleles[k, b0 : b0 + bw] < 4)).sum()) if bw else 0
+            block = alleles[k, b0 : b0 + bw]
+            # A base or an N fills a block column; 4 is "inserts nothing here".
+            placed = int(((block >= 0) & (block != 4)).sum()) if bw else 0
             extra = length - placed
             if extra > 0:
                 before = int(t_at[j]) if j < n_t else n_frame
@@ -325,12 +415,13 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
         st = src.internals.stats
         eps = np.asarray(st.eps, dtype=np.float64)
         hp = np.asarray(st.hp_run).astype(np.int32)
+        own = slice(0, src.n_own if src.n_own >= 0 else src.read_row.size)
         ev = compact_evidence(
             round_index=src.record_round,
             template_id=src.template_id,
             internals=src.internals,
-            read_row=src.read_row,
-            haplotype_of_read=src.node_of_read,
+            read_row=src.read_row[own],
+            haplotype_of_read=src.node_of_read[own],
             member_pos=src.member_pos,
         )
         cols_t = ev["columns"]
@@ -383,7 +474,7 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
         gap_cols = np.flatnonzero(~keep_col)
         if gap_cols.size and alleles.shape[0]:
             sub = alleles[:, gap_cols]
-            gi, gk = np.nonzero((sub >= 0) & (sub < 4))
+            gi, gk = np.nonzero((sub >= 0) & (sub != 4))
             if gi.size:
                 before = np.searchsorted(cons_frames, gap_cols[gk])
                 before = np.clip(before, 0, n_cols)
@@ -430,6 +521,11 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
         return src.display.column(name).take(pa.array(reads_sel)).cast(kind)
 
     has_span = s_lo >= 0
+    absorbed = (
+        src.absorbed_from[reads_sel]
+        if src.absorbed_from is not None
+        else np.full(reads_sel.size, -1, dtype=np.int64)
+    )
     reads = pa.table(
         {
             "idx": pa.array(np.arange(reads_sel.size, dtype=np.int32)),
@@ -437,6 +533,7 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
             "read_id": src.read_ids.take(pa.array(reads_sel)).cast(pa.string()),
             "sample_id": _disp("sample_id", pa.int64()),
             "node": pa.array(src.node_of_read[reads_sel].astype(np.int32)),
+            "absorbed_from": pa.array(absorbed, mask=absorbed < 0),
             "sampled": pa.array(sampled),
             "folded": pa.array(folded, pa.bool_())
             if folded is not None
@@ -524,6 +621,7 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
         arcs=arcs,
         verified=src.verified,
         warnings=src.warnings,
+        mismatch=src.mismatch,
     )
 
 

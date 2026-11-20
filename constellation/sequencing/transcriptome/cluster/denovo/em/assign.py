@@ -135,6 +135,26 @@ def reason_tallies() -> dict[str, int]:
     return {f"n_{reason}": 0 for reason in UNASSIGNED_REASONS}
 
 
+def lazy_round1(round_index: int, round1_rule: str) -> bool:
+    """Whether the two-pass reducer walks this round lazily: round 1 under
+    the replication rule aligns a read's candidates in replication order and
+    stops at the first admitted one."""
+    return int(round_index) <= 1 and round1_rule != "identity_band"
+
+
+def runner_up_measured(round_index: int, *, estep_aligner: str, round1_rule: str) -> bool:
+    """Whether a round's rule learns who came second.
+
+    Not under the lazy round-1 walk of the two-pass aligners (``edlib`` /
+    ``native`` with ORF seeding), which stops at its first admitted template:
+    a null runner-up there is unknown, not "no rival" — reading it as the
+    latter reported every read of such a round uncontested.
+    """
+    return not (
+        estep_aligner in ("edlib", "native") and lazy_round1(round_index, round1_rule)
+    )
+
+
 def _identity_columns(
     has: np.ndarray,
     slot: np.ndarray,
@@ -562,8 +582,8 @@ def assign_block_edlib(
         frac=shortlist_frac,
         support=np.asarray(store.node_weight, dtype=np.float64)[hb.template_row],
     )
-    lazy_round1 = round_index <= 1 and round1_rule != "identity_band"
-    if lazy_round1:
+    is_lazy = lazy_round1(round_index, round1_rule)
+    if is_lazy:
         # Replication-first round 1 ranks on something the chain score knows
         # nothing about, so a chain-score shortlist would hand the ranking
         # an arbitrary subset (measured on the synthetic panel: 55% of reads
@@ -651,7 +671,7 @@ def assign_block_edlib(
     runner = np.full(n_groups, sched.UNASSIGNED, dtype=np.int64)
     by_logl = np.zeros(n_groups, dtype=bool)
 
-    if lazy_round1:
+    if is_lazy:
         quality = np.asarray(store.seed_read_quality, dtype=np.float64)[t_row]
         rep = np.asarray(store.orf_replication, dtype=np.int64)[t_row]
         order = np.lexsort((t_row, -quality, -rep, sub_grp))
@@ -742,7 +762,7 @@ def assign_block_edlib(
     best_score = np.maximum.reduceat(masked, sub_ptr[:-1]) if m else np.zeros(n_groups)
     best_score = np.where(np.isfinite(best_score), best_score, 0.0)
 
-    if lazy_round1:
+    if is_lazy:
         # The walk gave up after `shortlist_k` attempts with candidates left:
         # an admissible one may have been among them.
         truncated = ~has & (sizes > int(shortlist_k))
@@ -1330,5 +1350,7 @@ __all__ = [
     "assign_block",
     "assign_block_edlib",
     "assign_blocks",
+    "lazy_round1",
     "run_em_estep",
+    "runner_up_measured",
 ]
