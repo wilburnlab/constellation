@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from constellation.viz.modalities import DEFAULT_MODALITY, Modality, get_modality
 from constellation.viz.server.endpoints.tracks import invalidate_binding_cache
@@ -100,6 +100,12 @@ def open_session(request: Request, body: dict[str, Any] = Body(...)) -> dict:
 
 
 class AddSourceRequest(BaseModel):
+    """``path`` / ``kind`` / ``label``, plus whatever fields the
+    session's modality reads from a source entry (the transcriptome
+    browser's ``demux_dir``); the modality validates them."""
+
+    model_config = ConfigDict(extra="allow")
+
     path: str
     kind: str | None = None
     label: str | None = None
@@ -107,9 +113,13 @@ class AddSourceRequest(BaseModel):
 
 def _sources_to_entries(sources: tuple) -> list[dict[str, Any]]:
     """Turn a session's frozen source tuple back into a list of input
-    dicts suitable for the session's ``with_sources``."""
+    dicts suitable for the session's ``with_sources``. A source with a
+    ``to_entry()`` gives its own, so fields only its modality knows (the
+    transcriptome browser's ``demux_dir``) survive a rebuild."""
     return [
-        {"path": str(src.path), "kind": src.kind, "label": src.label}
+        src.to_entry()
+        if callable(getattr(src, "to_entry", None))
+        else {"path": str(src.path), "kind": src.kind, "label": src.label}
         for src in sources
     ]
 
@@ -140,9 +150,7 @@ def add_source(
     if session is None:
         raise HTTPException(404, f"unknown session_id: {session_id}")
     entries = _sources_to_entries(session.sources)
-    entries.append(
-        {"path": body.path, "kind": body.kind, "label": body.label}
-    )
+    entries.append(body.model_dump())
     try:
         rebuilt = session.with_sources(entries)
     except ValueError as exc:

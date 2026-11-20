@@ -592,6 +592,20 @@ Template 13194139534009 of round 12 (four nodes, 33 significant edges) shows in 
 
 **Deferred** (the viz notes list them): colour-by, the unsampled tail, round stepping, the noise-conformity plot, filtering arcs by signature.
 
+**Review (Codex, 2026-11-20).** Eight findings, all fixed, each with a test that fails on the code before:
+- Save SVG exports only the view asked for, once it has loaded, titled with its target, node and coordinates; while a replay runs or after one fails there is nothing to export.
+- Cached replays and support tables are keyed by the run's revision (`cache.run_revision`: the identity, time and size of each round's records and the final outputs), so a run finalized again or replaced is replayed again rather than served, still `verified`, from before.
+- A cancelled request stops waiting without cancelling work another request shares; work nobody waits on is cancelled, and its key is free either way.
+- The decoder no longer spreads every column into `Math.max` (150,000 columns overflowed the argument limit).
+- A cluster detail still in flight is dropped when the run changes.
+- Another node of a cluster's template is described as that node, with its own reads.
+- An N is no evidence in the per-read error indicator: not a departure, and off the span the expectation is taken over.
+- A source keeps its `demux_dir` when sources are added or removed (`to_entry()` on a source; the add-source request carries a modality's own fields).
+
+And the validation limits it listed: `min_reads` / `offset` bounded at int64, a template number a JavaScript number cannot hold is refused, a manifest that is not a JSON object is not an EM run, and `find_clusters` matches nothing for an id beyond int64 or a non-ASCII digit.
+
+**Next (PI, 2026-11-20):** PR3 is the EM extent fix — a read joins a template only when their ends agree within one end tolerance (30 nt), a node's ends are its reads' median ends, reads with no template of their extent seed new ones, truncation is answered afterwards by `contained` edges — together with the EM performance work already identified, after this PR merges. The graph and layout engine and the PRs after it move back one.
+
 ## 14. WebGL: the trade-offs (decided at PR4's first step)
 
 Only the star map needs it — 10⁵–10⁶ points, edges, picking, animation. The support view is Canvas2D (its level-of-detail table bounds what is drawn per frame), so nothing before PR4 waits on this.

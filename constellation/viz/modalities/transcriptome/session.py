@@ -44,6 +44,16 @@ class TxSource:
     def source_id(self) -> str:
         return derive_source_id(self.path, self.kind)
 
+    def to_entry(self) -> dict[str, Any]:
+        """The input dict that reopens this source, ``demux_dir`` included
+        (the server's source add / remove rebuilds a session from these)."""
+        return {
+            "path": str(self.path),
+            "kind": self.kind,
+            "label": self.label,
+            "demux_dir": str(self.demux_dir) if self.demux_dir else None,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class TxRun:
@@ -156,7 +166,10 @@ def is_em_run(path: Path) -> bool:
         m = json.loads(manifest.read_text())
     except (OSError, ValueError):
         return False
-    return m.get("kind") == "cluster" and (m.get("parameters") or {}).get("mode") == "em"
+    if not isinstance(m, dict):
+        return False
+    params = m.get("parameters")
+    return m.get("kind") == "cluster" and isinstance(params, dict) and params.get("mode") == "em"
 
 
 def _load_source(entry: dict[str, Any]) -> TxSource:

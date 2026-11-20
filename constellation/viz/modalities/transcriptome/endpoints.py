@@ -39,6 +39,7 @@ from constellation.viz.modalities.transcriptome.cache import (
     REPLAYS,
     SUPPORT,
     cluster_index_for,
+    run_revision,
 )
 from constellation.viz.modalities.transcriptome.session import TranscriptomeSession, TxRun
 from constellation.viz.server.arrow_stream import batches_to_response
@@ -56,6 +57,8 @@ CLUSTER_SORTS = (
 SUPPORT_TABLES = ("reads", "departures", "insertions", "columns", "arcs", "differences")
 #: JSON integers a JavaScript number holds exactly.
 _JS_SAFE = 2**53
+#: The largest read count or offset worth asking for (an Arrow int64).
+_INT64_MAX = 2**63 - 1
 
 
 def _session(request: Request, session_id: str) -> TranscriptomeSession:
@@ -138,8 +141,8 @@ async def list_clusters(
     q: str | None = None,
     sort: str = "n_reads",
     descending: bool = True,
-    min_reads: int = Query(1, ge=0),
-    offset: int = Query(0, ge=0),
+    min_reads: int = Query(1, ge=0, le=_INT64_MAX),
+    offset: int = Query(0, ge=0, le=_INT64_MAX),
     limit: int = Query(200, ge=1, le=5000),
 ):
     run = _run(request, session_id, key)
@@ -262,7 +265,9 @@ def _make_support(rep, node: str | int, space: str) -> dict[str, Any]:
 async def _support(run: TxRun, target: tuple, node: str, space: str) -> dict[str, Any]:
     from constellation.sequencing.transcriptome.cluster.denovo.em.results import ReplayError
 
-    rkey = (str(run.path), *target)
+    # The revision makes a changed run a different key: a replay certified
+    # on the files before is never served for the files after.
+    rkey = (await asyncio.to_thread(run_revision, run.path), *target)
     want = _node(node)
 
     def compute() -> dict[str, Any]:

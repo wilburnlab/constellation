@@ -229,6 +229,10 @@ describe('TranscriptomeBrowser', () => {
     expect(parseTemplate(12, '13194139969773')).toBe(13194139969773);
     expect(parseTemplate(12, '1234')).toBe(12 * 2 ** 40 + 1234);
     expect(parseTemplate(12, 'x')).toBeNull();
+    // Only ids a JavaScript number holds exactly.
+    expect(parseTemplate(12, '9'.repeat(400))).toBeNull();
+    expect(parseTemplate(12, String(2 ** 53))).toBeNull();
+    expect(parseInitial('#template=12:' + '9'.repeat(30))).toBeUndefined();
   });
 
   it('says what is shown, how to move, and what the colours mean', async () => {
@@ -262,6 +266,83 @@ describe('TranscriptomeBrowser', () => {
     expect(svg).not.toContain('Raster:');
     // The matrix cell holds rects (spans and ticks), not an image.
     expect((svg.match(/<rect/g) ?? []).length).toBeGreaterThan(10);
+  });
+
+  it('exports only the view asked for, under its own name', async () => {
+    const support = await open();
+    const ok = support.exportSvg()!;
+    expect(ok).toContain('Support of cluster 42 (consensus coordinates)');
+    const save = host.querySelector('.tx-btn[title^="vector"]') as HTMLButtonElement;
+    expect(save.disabled).toBe(false);
+
+    // A new selection whose replay is still running: nothing to export,
+    // since the data on hand is cluster 42's.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const real = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: string) => {
+      if (input.includes('/clusters/7/')) await gate;
+      return real(input);
+    });
+    const pending = support.show({ kind: 'cluster', clusterId: 7 });
+    await flush();
+    expect(support.exportSvg()).toBeNull();
+    expect(save.disabled).toBe(true);
+    release();
+    await pending;
+
+    // A selection that fails: still nothing, not cluster 42 under 3's name.
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ detail: 'no such cluster' }), { status: 404 }));
+    await support.show({ kind: 'cluster', clusterId: 3 });
+    expect(support.exportSvg()).toBeNull();
+    expect(save.disabled).toBe(true);
+  });
+
+  it('a sibling node is described as itself, not as the cluster', async () => {
+    server.meta = (url) =>
+      supportMeta({
+        kind: 'node',
+        cluster_id: 42,
+        haplotype_id: 0,
+        reference: url.searchParams.get('node') === 'cluster' ? '0' : String(url.searchParams.get('node')),
+      });
+    const support = await open();
+    expect(support.describeView()).toContain('Cluster 42 is node 0');
+    const nodeSel = host.querySelector('.tx-support select') as HTMLSelectElement;
+    nodeSel.value = '1';
+    nodeSel.dispatchEvent(new Event('change'));
+    await flush();
+    const text = support.describeView();
+    expect(text).toContain('Node 1 of');
+    expect(text).toContain('beside cluster 42 (node 0)');
+    expect(text).not.toContain('Cluster 42 is node');
+    expect(support.exportSvg()).toContain('cluster 42, node 1 of its template (consensus coordinates)');
+  });
+
+  it('a cluster detail still on its way is dropped when the run changes', async () => {
+    const other = { ...RUN, key: 'src-other', label: 'other_run' };
+    let answer!: (r: Response) => void;
+    const late = new Promise<Response>((r) => (answer = r));
+    const real = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: string) => {
+      const path = new URL(input, 'http://x').pathname;
+      if (path === `/api/transcriptome/sessions/${SID}/runs`)
+        return new Response(JSON.stringify([RUN, other]), { status: 200 });
+      if (path === `${BASE}/clusters/42`) return late;
+      return real(input.replace('src-other', KEY));
+    });
+    browser = new TranscriptomeBrowser({ host, sessionId: SID });
+    await browser.mount();
+    await flush();
+    (host.querySelector('.tx-picker-table tbody tr') as HTMLTableRowElement).click();
+    await flush();
+    const runSel = host.querySelector('.tx-top select') as HTMLSelectElement;
+    runSel.value = 'src-other';
+    runSel.dispatchEvent(new Event('change'));
+    await flush();
+    answer(new Response(JSON.stringify(DETAIL), { status: 200 }));
+    await flush();
+    expect(host.querySelector('.tx-detail')?.textContent ?? '').not.toContain('cluster 42');
   });
 
   it('dispose removes the widget and drops late replies', async () => {

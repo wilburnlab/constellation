@@ -325,3 +325,125 @@ def test_the_cli_refuses_to_start_with_nothing_to_open(tmp_path, capsys) -> None
     Args.run = [tmp_path]
     assert cmd_viz_transcriptome(Args()) == 1
     assert "not an EM run" in capsys.readouterr().err
+
+
+# ── review of the support branch (2026-11-20) ─────────────────────────
+
+
+def test_a_run_finalized_again_is_replayed_again(client, run_dir, tmp_path) -> None:
+    """Cached replays are keyed by the run's revision: when the files a
+    replay reads change, the old verdict is not served, even after the
+    session is reopened."""
+    out = tmp_path / "em"
+    shutil.copytree(run_dir, out)
+    nodes = _cluster_nodes(out)
+    row = next(r for r in nodes.to_pylist() if not r["rebuilt"])
+    sid = _open(client, out)
+    url = f"{_base(sid, out)}/clusters/{row['cluster_id']}/support"
+    assert client.get(url).json()["verified"] is True
+    ids = nodes.column("consensus_content_id").to_pylist()
+    i = nodes.column("cluster_id").to_pylist().index(row["cluster_id"])
+    ids[i] ^= 1
+    changed = nodes.set_column(
+        nodes.schema.get_field_index("consensus_content_id"),
+        "consensus_content_id",
+        pa.array(ids, pa.int64()),
+    )
+    pq.write_table(changed, out / "cluster_nodes.parquet")
+    sid = _open(client, out)
+    got = client.get(f"{_base(sid, out)}/clusters/{row['cluster_id']}/support").json()
+    assert got["verified"] is False
+
+
+def test_a_cancelled_request_neither_poisons_its_key_nor_cancels_others() -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    async def alone(pool) -> None:
+        # The only request for a queued key is cancelled: the work is
+        # cancelled with it, and the key can be asked for again.
+        flight = cache.SingleFlight(2, pool)
+        release, running = threading.Event(), threading.Event()
+
+        def block():
+            running.set()
+            release.wait(5)
+
+        first = asyncio.create_task(flight.aget("blocker", block))
+        while not running.is_set():
+            await asyncio.sleep(0.001)
+        queued = asyncio.create_task(flight.aget("wanted", lambda: 42))
+        await asyncio.sleep(0.01)
+        queued.cancel()
+        await asyncio.gather(queued, return_exceptions=True)
+        release.set()
+        await first
+        assert await asyncio.wait_for(flight.aget("wanted", lambda: 43), 2) == 43
+
+    async def shared(pool) -> None:
+        # Two requests share queued work and one is cancelled: the other
+        # still gets the value.
+        release = threading.Event()
+        blocker = pool.submit(lambda: release.wait(5))
+        flight = cache.SingleFlight(2, pool)
+        a = asyncio.create_task(flight.aget("same", lambda: 42))
+        b = asyncio.create_task(flight.aget("same", lambda: 99))
+        await asyncio.sleep(0.01)
+        a.cancel()
+        await asyncio.gather(a, return_exceptions=True)
+        release.set()
+        blocker.result()
+        assert await asyncio.wait_for(b, 2) == 42
+
+    for scenario in (alone, shared):
+        with ThreadPoolExecutor(1) as pool:
+            asyncio.run(scenario(pool))
+
+
+def test_adding_or_removing_a_source_keeps_each_demux_dir(client, run_dir, tmp_path) -> None:
+    demux = tmp_path / "demux"
+    (demux / "samples").mkdir(parents=True)
+    pq.write_table(
+        pa.table({"sample_id": pa.array([0, 1], pa.int64()), "sample_name": ["a", "b"]}),
+        demux / "samples" / "samples.parquet",
+    )
+    other = tmp_path / "em2"
+    shutil.copytree(run_dir, other)
+    sid = _open(client, run_dir, demux_dir=str(demux))
+    added = client.post(
+        f"/api/sessions/{sid}/sources", json={"path": str(other), "demux_dir": str(demux)}
+    )
+    assert added.status_code == 201, added.text
+    runs = {r["path"]: r for r in added.json()["runs"]}
+    assert runs[str(run_dir.resolve())]["samples"] == {"0": "a", "1": "b"}
+    assert runs[str(other.resolve())]["samples"] == {"0": "a", "1": "b"}
+    source_id = derive_source_id(other.resolve(), "em_run")
+    removed = client.delete(f"/api/sessions/{sid}/sources/{source_id}")
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["runs"][0]["samples"] == {"0": "a", "1": "b"}
+
+
+@pytest.mark.parametrize("value", [[], None, 3, {"kind": "cluster", "parameters": [1]}])
+def test_a_manifest_of_another_shape_is_refused(client, tmp_path, value) -> None:
+    import json
+
+    (tmp_path / "rounds").mkdir()
+    (tmp_path / "manifest.json").write_text(json.dumps(value))
+    response = client.post(
+        "/api/sessions/open",
+        json={"modality": "transcriptome", "sources": [{"path": str(tmp_path)}]},
+    )
+    assert response.status_code == 400
+    assert "not an EM run" in response.text
+
+
+def test_out_of_range_queries_are_refused_or_match_nothing(client, run_dir) -> None:
+    sid = _open(client, run_dir)
+    url = f"{_base(sid, run_dir)}/clusters"
+    for param in ("min_reads", "offset"):
+        assert client.get(url, params={param: 2**80}).status_code == 422
+    assert _arrow(client.get(url, params={"min_reads": 2**63 - 1})).num_rows == 0
+    for q in (str(2**63), str(2**80), "9" * 5000, "²"):
+        response = client.get(url, params={"q": q})
+        assert _arrow(response).num_rows == 0, q
+        assert response.headers["X-Total-Rows"] == "0"

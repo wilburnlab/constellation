@@ -105,6 +105,31 @@ function niceStep(span: number, px: number, minPx = 70): number {
   return Math.max(1, 10 * pow);
 }
 
+/** What a support view's data was loaded for. */
+interface LoadedView {
+  target: SupportTarget;
+  node: NodeChoice;
+  space: Space;
+}
+
+/** A loaded view's identity, for an export's title and file name: whose
+ *  reads, against which node, in which coordinates. */
+export function describeLoaded(v: LoadedView): string {
+  const t = v.target;
+  const base = t.kind === 'cluster' ? `cluster ${t.clusterId}` : templateLabel(t.templateId);
+  const node =
+    v.node === 'pooled'
+      ? t.kind === 'cluster'
+        ? ', its template pooled'
+        : ', pooled'
+      : typeof v.node === 'number'
+        ? t.kind === 'cluster'
+          ? `, node ${v.node} of its template`
+          : `, node ${v.node}`
+        : '';
+  return `${base}${node} (${v.space} coordinates)`;
+}
+
 export class SupportView {
   readonly root: HTMLDivElement;
   private readonly opts: SupportViewOptions;
@@ -132,6 +157,13 @@ export class SupportView {
   private space: Space = 'consensus';
   private compare = false;
   private data: SupportData | null = null;
+  /** What `data` is of: the target, node and space it was loaded for.
+   *  `target` / `node` / `space` say what is being loaded, which differs
+   *  while a load runs and after one fails. */
+  private loaded: LoadedView | null = null;
+  /** The last load succeeded and nothing newer is running: the view on
+   *  screen is the one asked for, so it can be exported. */
+  private ready = false;
   private shownIndex: MatrixIndex | null = null;
   /** Display column → data column, when the columns are restricted. */
   private shownCols: Int32Array | null = null;
@@ -244,7 +276,10 @@ export class SupportView {
     this.resetBtn.addEventListener('click', () => this.resetOrder());
     this.saveBtn.addEventListener('click', () => {
       const svg = this.exportSvg();
-      if (svg) downloadSvg(`support-${this.describeTarget().replace(/\s+/g, '-')}.svg`, svg);
+      if (svg && this.loaded) {
+        const name = describeLoaded(this.loaded).replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
+        downloadSvg(`support-${name}.svg`, svg);
+      }
     });
     this.body.addEventListener('pointermove', (e) => {
       this.pointer = { x: e.clientX, y: e.clientY };
@@ -310,6 +345,9 @@ export class SupportView {
   private async load(): Promise<void> {
     if (!this.target) return;
     const gen = ++this.generation;
+    const want: LoadedView = { target: this.target, node: this.node, space: this.space };
+    this.ready = false;
+    this.saveBtn.disabled = true;
     this.startProgress();
     try {
       const response = await fetch(this.url());
@@ -333,6 +371,9 @@ export class SupportView {
       );
       if (gen !== this.generation) return;
       this.data = supportFromTables(meta, Object.fromEntries(tables));
+      this.loaded = want;
+      this.ready = true;
+      this.saveBtn.disabled = false;
       this.excess = departureExcess(this.data);
       this.order = defaultOrder(this.data);
       this.orderNote = null;
@@ -379,7 +420,7 @@ export class SupportView {
         this.space = 'frame';
         await this.load();
       }
-      if (!this.data || this.data.differences.n === 0) return;
+      if (!this.ready || !this.data || this.data.differences.n === 0) return;
       this.compare = true;
     }
     this.rebuildShown();
@@ -540,10 +581,16 @@ export class SupportView {
       what =
         `All ${n(reads)} reads of ${tmpl}${split}, one per row, against the consensus of all of them ` +
         'pooled: a split shows as blocks of reads that differ together';
+    } else if ((m.kind === 'node' || m.kind === 'merged') && m.reference !== String(m.haplotype_id)) {
+      // Another node of the cluster's template: its own reads, not the
+      // cluster's (the server restricts the reads to the node asked for).
+      what =
+        `Node ${m.reference} of ${tmpl}${split}, beside cluster ${m.cluster_id} (node ${m.haplotype_id}). ` +
+        `Node ${m.reference}'s ${n(reads)} reads, one per row, against its own consensus (${n(m.n_columns)} nt)`;
     } else if (m.kind === 'node' || m.kind === 'merged') {
       what =
         `Cluster ${m.cluster_id} is node ${m.haplotype_id} of ${tmpl}${split}. ` +
-        `Its ${n(reads)} reads, one per row, against node ${m.reference}'s consensus (${n(m.n_columns)} nt)`;
+        `Its ${n(reads)} reads, one per row, against its consensus (${n(m.n_columns)} nt)`;
     } else {
       what = `Node ${m.reference} of ${tmpl}${split}: its ${n(reads)} reads, one per row, against its consensus`;
     }
@@ -1034,7 +1081,9 @@ export class SupportView {
   /** The view as one SVG document: tracks, per-read columns, and the
    *  matrix as vectors under the glyph budget or as an image over it. */
   exportSvg(): string | null {
-    if (!this.data || !this.shownIndex) return null;
+    // Not while a load runs or after one failed: the data on hand is then
+    // of something other than what the toolbar names.
+    if (!this.ready || !this.loaded || !this.data || !this.shownIndex) return null;
     const vp = this.viewport();
     const index = this.shownIndex;
     const order = this.order;
@@ -1059,7 +1108,7 @@ export class SupportView {
       { svg: matrix.svg, x: SIDE_W, y: TRACKS_H, width: vp.widthPx, height: vp.heightPx },
     ];
     return buildGridSvg(cells, {
-      title: `Support of ${this.describeTarget()}`,
+      title: `Support of ${describeLoaded(this.loaded)}`,
       widthPx: SIDE_W + vp.widthPx,
       heightPx: TRACKS_H + vp.heightPx,
     }).svg;

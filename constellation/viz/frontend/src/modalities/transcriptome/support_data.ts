@@ -9,7 +9,7 @@
 // together sit together, so a split is a block.
 
 import type { Table } from 'apache-arrow';
-import { MatrixData, MatrixIndex, alleleAt, indexMatrix } from '../../engine/matrix/model';
+import { ALLELE_N, MatrixData, MatrixIndex, alleleAt, indexMatrix } from '../../engine/matrix/model';
 import type { SupportMeta } from './types';
 
 export interface ReadInfo {
@@ -203,7 +203,10 @@ export function supportFromTables(meta: SupportMeta, tables: Record<string, Tabl
     const col = columns.col[i];
     if (col >= 0 && col < nCols) columnRow[col] = i;
   }
-  const maxFrame = columns.n ? Math.max(...Array.from(columns.frameCol)) + 1 : 0;
+  // A loop, not `Math.max(...cols)`: a spread passes every column as an
+  // argument, and a long alignment exceeds the engine's argument limit.
+  let maxFrame = 0;
+  for (let i = 0; i < columns.n; i += 1) maxFrame = Math.max(maxFrame, columns.frameCol[i] + 1);
   const colOfFrame = new Int32Array(Math.max(maxFrame, 0)).fill(-1);
   for (let i = 0; i < columns.n; i += 1) colOfFrame[columns.frameCol[i]] = columns.col[i];
 
@@ -382,16 +385,24 @@ export function restrictColumns(m: MatrixData, cols: Int32Array): MatrixData {
 /** Each read's departure count against the expected for its length at a
  *  per-base error rate — the noise-conformity check a node of one
  *  transcript should pass: reads hotter than thermal are candidate
- *  mis-assignments or unresolved variants. */
+ *  mis-assignments or unresolved variants.
+ *
+ *  An ambiguous base (allele 5, N) is no evidence either way: it is not
+ *  counted as a departure, and its column leaves the span the expectation
+ *  is taken over. A read with no comparable column is NaN (no indicator). */
 export function departureExcess(data: SupportData, errorRate = 0.012): Float64Array {
   const { matrix, index } = data;
   const out = new Float64Array(matrix.nRows).fill(NaN);
   for (let r = 0; r < matrix.nRows; r += 1) {
     if (matrix.spanLo[r] < 0) continue;
-    const len = matrix.spanHi[r] - matrix.spanLo[r];
-    const observed = index.depStart[r + 1] - index.depStart[r];
-    const expected = Math.max(1e-9, len * errorRate);
-    out[r] = observed / expected;
+    let ambiguous = 0;
+    for (let i = index.depStart[r]; i < index.depStart[r + 1]; i += 1) {
+      if (index.depAllele[i] === ALLELE_N) ambiguous += 1;
+    }
+    const comparable = matrix.spanHi[r] - matrix.spanLo[r] - ambiguous;
+    if (comparable <= 0) continue;
+    const observed = index.depStart[r + 1] - index.depStart[r] - ambiguous;
+    out[r] = observed / Math.max(1e-9, comparable * errorRate);
   }
   return out;
 }

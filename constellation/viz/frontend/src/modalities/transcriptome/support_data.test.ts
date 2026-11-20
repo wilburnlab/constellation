@@ -1,5 +1,6 @@
+import { Int32, Table, vectorFromArray } from 'apache-arrow';
 import { describe, expect, it } from 'vitest';
-import { alleleAt } from '../../engine/matrix/model';
+import { ALLELE_N, alleleAt, indexMatrix } from '../../engine/matrix/model';
 import { supportMeta, supportTables } from './__fixtures__/support';
 import { arcEffect, arcGeometry, arcOpacity, arcPath, arcWidth, ARC_NEGATIVE, ARC_POSITIVE, MIN_ARC_HEIGHT } from './arcs';
 import {
@@ -65,6 +66,47 @@ describe('comparison', () => {
     expect(x[0]).toBe(0);
     expect(x[3]).toBeCloseTo(2 / (12 * 0.012));
     expect(Number.isNaN(x[5])).toBe(true);
+  });
+
+  it('an ambiguous base is no evidence: not a departure, and off the span it is judged over', () => {
+    const d = data();
+    // Read 3 (span 12) departs at two columns; make one of them an N.
+    const i = Array.from(d.matrix.depRow).findIndex((r) => r === 3);
+    d.matrix.depAllele[i] = ALLELE_N;
+    d.index = indexMatrix(d.matrix);
+    let x = departureExcess(d, 0.012);
+    expect(x[3]).toBeCloseTo(1 / (11 * 0.012));
+    // Only Ns: no excess at all (it was 2 / 0.144 = 13.9x before).
+    d.matrix.depAllele.fill(ALLELE_N);
+    d.index = indexMatrix(d.matrix);
+    x = departureExcess(d, 0.012);
+    expect(x[3]).toBe(0);
+    expect(x[4]).toBe(0);
+  });
+
+  it('a read with no comparable column gets no indicator', () => {
+    const d = data();
+    // Read 3 covers 12 columns; make every one an N.
+    const n = d.matrix.spanHi[3] - d.matrix.spanLo[3];
+    d.matrix.depRow = Int32Array.from({ length: n }, () => 3);
+    d.matrix.depCol = Int32Array.from({ length: n }, (_, c) => d.matrix.spanLo[3] + c);
+    d.matrix.depAllele = new Int8Array(n).fill(ALLELE_N);
+    d.index = indexMatrix(d.matrix);
+    expect(Number.isNaN(departureExcess(d)[3])).toBe(true);
+  });
+});
+
+describe('long alignments', () => {
+  it('decodes 150,000 columns (no argument spread over the columns)', () => {
+    const n = 150_000;
+    const tables = supportTables();
+    tables.columns = new Table({
+      col: vectorFromArray(Array.from({ length: n }, (_, i) => i), new Int32()),
+      frame_col: vectorFromArray(Array.from({ length: n }, (_, i) => i), new Int32()),
+    });
+    const d = supportFromTables(supportMeta({ n_columns: n, consensus: 'A'.repeat(n) }), tables);
+    expect(d.colOfFrame.length).toBe(n);
+    expect(d.colOfFrame[n - 1]).toBe(n - 1);
   });
 });
 

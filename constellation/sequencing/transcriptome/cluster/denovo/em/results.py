@@ -327,8 +327,11 @@ def find_clusters(
     q = query.strip()
     ids = table.column("cluster_id").to_numpy(zero_copy_only=False)
     hits = np.zeros(table.num_rows, dtype=bool)
-    if q.isdigit():
-        n = int(q)
+    # ASCII digits only (``"²".isdigit()`` is true and ``int`` refuses it),
+    # and only a value an int64 id can hold (at most 19 digits, which also
+    # keeps ``int`` under Python's digit limit): a larger one matches nothing.
+    n = int(q) if q.isascii() and q.isdigit() and len(q) <= 19 else None
+    if n is not None and n < 2**63:
         hits |= ids == n
         for name in ("consensus_content_id", "protein_content_id"):
             if name in table.column_names:

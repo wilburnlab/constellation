@@ -26,7 +26,8 @@ export function parseInitial(hash: string): TranscriptomeBrowserOptions['initial
   const template = params.get('template')?.match(/^(\d+):#?(\d+)$/);
   if (template) {
     const round = Number(template[1]);
-    return { template: { round, templateId: parseTemplate(round, template[2])! } };
+    const templateId = Number.isSafeInteger(round) ? parseTemplate(round, template[2]) : null;
+    if (templateId !== null) return { template: { round, templateId } };
   }
   return undefined;
 }
@@ -39,12 +40,15 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
 }
 
 /** A template typed by a person: its number within the round (`1234`,
- *  `#1234`) or its full id, `(round << 40) | number`. Null if neither. */
+ *  `#1234`) or its full id, `(round << 40) | number`. Null if neither, or
+ *  if the id is not an integer a JavaScript number holds exactly. */
 export function parseTemplate(round: number, text: string): number | null {
   const m = text.trim().match(/^#?(\d+)$/);
   if (!m) return null;
   const v = Number(m[1]);
-  return v >= TEMPLATE_ROUND_UNIT ? v : templateIdOf(round, v);
+  if (!Number.isSafeInteger(v)) return null;
+  const id = v >= TEMPLATE_ROUND_UNIT ? v : templateIdOf(round, v);
+  return Number.isSafeInteger(id) ? id : null;
 }
 
 const TEMPLATE_HELP =
@@ -145,6 +149,8 @@ export class TranscriptomeBrowser {
   }
 
   private async selectRun(run: RunInfo): Promise<void> {
+    // A cluster detail still on its way is of the run being left.
+    this.detailGen += 1;
     this.run = run;
     this.runSel.value = run.key;
     this.picker?.dispose();
@@ -184,14 +190,16 @@ export class TranscriptomeBrowser {
 
   private async selectCluster(row: ClusterRow): Promise<void> {
     const gen = ++this.detailGen;
+    const run = this.run;
+    const current = () => gen === this.detailGen && run === this.run;
     void this.support?.show({ kind: 'cluster', clusterId: row.cluster_id });
     this.detail.textContent = 'loading…';
     try {
       const d = await fetchJson<ClusterDetail>(`${this.base}/clusters/${row.cluster_id}`);
-      if (gen !== this.detailGen) return;
+      if (!current()) return;
       this.renderDetail(d);
     } catch (err) {
-      if (gen === this.detailGen) this.detail.textContent = `detail failed: ${(err as Error).message}`;
+      if (current()) this.detail.textContent = `detail failed: ${(err as Error).message}`;
     }
   }
 
