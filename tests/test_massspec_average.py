@@ -16,6 +16,7 @@ import json
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401  (pa.compute)
 import pyarrow.parquet as pq
 import pytest
 from _massspec_fixtures import write_bundle, write_bundle_manifest
@@ -200,7 +201,8 @@ class TestAverageBundle:
         monkeypatch.setattr(driver.shutil, "copy2", broken)
         with pytest.raises(RuntimeError):
             average_bundle(profile, output_parent=tmp_path / "out")
-        assert list((tmp_path / "out").iterdir()) == []  # neither the average nor its partial directory
+        # neither the average nor its staging directory (the writer's lock file stays, as every lock here does)
+        assert [p.name for p in (tmp_path / "out").iterdir()] == [".run.average.lock"]
 
     def test_the_same_run_averages_to_the_same_bytes(self, profile, tmp_path):
         a = average_bundle(profile, output_parent=tmp_path / "a", skip_first=1)
@@ -506,11 +508,12 @@ class TestOutputSafety:
         assert {r.output for r in results if r.status == "ok"} == {tmp_path / "y" / "a_run.average", tmp_path / "y" / "b_run.average"}
 
     def test_force_never_removes_what_is_not_an_average_of_this_run(self, profile, tmp_path):
-        from constellation.massspec.bundle import prepare_derived_bundle
+        from constellation.massspec.bundle import derived_bundle_writer
 
         # The profile's own parent (what `-o <parent> --force` removed before).
         with pytest.raises(ValueError, match="holds"):
-            prepare_derived_bundle(tmp_path, profile, force=True)
+            with derived_bundle_writer(tmp_path, profile, force=True):
+                pass
         # Someone's directory where the average would go.
         theirs = tmp_path / "out" / "run.average"
         theirs.mkdir(parents=True)
@@ -525,7 +528,7 @@ class TestOutputSafety:
         with pytest.raises(ValueError, match="nothing to average"):
             average_bundle(profile, skip_first=99, force=True)
         assert (out / "manifest.json").read_text() == before
-        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".") and not p.name.endswith(".lock")]
 
     def test_a_forced_rerun_replaces_it_whole(self, profile):
         out = average_bundle(profile)
@@ -615,3 +618,119 @@ def test_summarize_describes_the_average_not_the_run(tmp_path):
     summary = summarize_bundle(average_bundle(bundle))
     assert summary["acquisition_type"] is None
     assert summary["n_scans_without_injection_time"] == 1  # one kind of scan, not the run's five scans
+
+
+# ── Codex's review (2026-11-21) ───────────────────────────────────────
+
+
+class TestCodexReview:
+    """Each case reproduces a finding of the review on the code before its fix."""
+
+    def test_1a_the_browser_keeps_a_run_and_its_average_apart(self, family):
+        from constellation.viz.modalities.massspec.session import MassSpecSession
+
+        session = MassSpecSession.open(sources=[{"path": str(family["dir"] / "run")}, {"path": str(family["average"])}])
+        assert len(session.acquisitions) == 2  # one hash, two kinds of spectra: not one acquisition
+
+    def test_1b_an_experiment_never_takes_an_average_for_the_searched_run(self, family, tmp_path):
+        from constellation.massspec.acquisitions import Acquisitions, acquisition_record_from_bundle, save_acquisitions
+        from constellation.massspec.results import acquisition_bundles
+
+        experiment = tmp_path / "experiment"
+        registered, _ = Acquisitions.empty().register([acquisition_record_from_bundle(family["dir"] / "run")])
+        save_acquisitions(registered, experiment / "acquisitions")
+        assert acquisition_bundles(experiment, candidates=[family["average_list"]])[0]["bundle"] is None
+        assert acquisition_bundles(experiment, candidates=[family["dir"] / "run"])[0]["bundle"] == family["dir"] / "run"
+
+    def test_2_a_second_writer_never_removes_the_first_ones_work(self, profile, monkeypatch):
+        import threading
+
+        from constellation.massspec import average as module
+
+        started, release, made = threading.Event(), threading.Event(), {}
+        real = module._accumulate
+
+        def held(*args, **kwargs):
+            started.set()
+            release.wait(30)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, "_accumulate", held)
+        first = threading.Thread(target=lambda: made.setdefault("out", average_bundle(profile)))
+        first.start()
+        try:
+            assert started.wait(30)
+            monkeypatch.setattr(module, "_accumulate", real)
+            staged = [p for p in profile.parent.iterdir() if p.name.startswith(".run.average.partial")]
+            assert staged
+            with pytest.raises(FileExistsError, match="being written"):
+                average_bundle(profile, force=True)
+            assert all(p.is_dir() for p in staged)
+        finally:
+            release.set()
+            first.join(30)
+        assert (made["out"] / "manifest.json").is_file()
+
+    def test_3_a_folder_skips_only_this_runs_finished_average(self, tmp_path):
+        out = tmp_path / "out"
+        for name, sha in (("a", "S1"), ("b", "S2")):  # two runs of one name, in two folders
+            (tmp_path / name).mkdir()
+            write_bundle_manifest(write_bundle(tmp_path / name, "x.profile", _scans(), profile=True), run="x", sha256=sha)
+        assert [r.status for r in average_directory(tmp_path / "a", output_parent=out)] == ["ok"]
+        second = average_directory(tmp_path / "b", output_parent=out)
+        assert second[0].status == "error" and "not a bundle made from" in second[0].detail
+        empty = tmp_path / "empty" / "x.average"
+        empty.mkdir(parents=True)
+        (empty / "manifest.json").write_text("{}")  # says nothing: not a finished average
+        assert average_directory(tmp_path / "a", output_parent=tmp_path / "empty")[0].status == "error"
+
+    def test_4_skipped_scans_do_not_set_the_grid(self, tmp_path):
+        scans = _scans()
+        for s in scans[:8]:  # the first cycle, which skip_first=1 leaves out, half a step off
+            s["mz"] = s["mz"] - (STEP1 if s["level"] == 1 else STEP2) / 2
+        bundle = write_bundle_manifest(write_bundle(tmp_path, "k.profile", scans, profile=True), run="k")
+        _, _, _, summary = _out(average_bundle(bundle, skip_first=1))
+        assert [s["n_points_off_grid"] for s in summary] == [0] * 8
+        assert [s["n_points"] for s in summary] == [GRID1.size] * 2 + [GRID2.size] * 6
+
+    def test_5_one_point_off_the_grid_does_not_move_it(self, tmp_path):
+        scans = _scans()
+        scans[-1]["mz"] = scans[-1]["mz"].copy()
+        scans[-1]["mz"][0] -= STEP2 / 2  # one endpoint half a step below the grid
+        bundle = write_bundle_manifest(write_bundle(tmp_path, "e.profile", scans, profile=True), run="e")
+        _, _, _, summary = _out(average_bundle(bundle))
+        assert summary[-1]["n_points_off_grid"] == 1 and summary[-1]["n_points"] == GRID2.size
+
+    def test_6_the_average_is_finished_in_bounded_groups_of_kinds(self, profile, tmp_path, monkeypatch):
+        from constellation.massspec import average as module
+
+        whole = average_bundle(profile, output_parent=tmp_path / "whole")
+        monkeypatch.setattr(module, "FINISH_POINTS", 200)  # fewer than one kind's grid: a kind at a time
+        grouped = average_bundle(profile, output_parent=tmp_path / "grouped")
+        for part in ("profile", POINTS_DIR, "scan_metadata.parquet", SUMMARY_FILENAME):
+            assert pq.read_table(whole / part).equals(pq.read_table(grouped / part)), part
+
+    def test_7_a_failed_publication_puts_the_old_average_back(self, profile, monkeypatch):
+        from constellation.massspec import bundle
+
+        out = average_bundle(profile)
+        before = (out / "manifest.json").read_text()
+        real, calls = bundle.os.replace, []
+
+        def flaky(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:  # the new bundle into place
+                raise OSError("the disk went away")
+            return real(src, dst)
+
+        monkeypatch.setattr(bundle.os, "replace", flaky)
+        with pytest.raises(OSError, match="went away"):
+            average_bundle(profile, skip_first=1, force=True)
+        monkeypatch.undo()
+        assert (out / "manifest.json").read_text() == before
+
+    def test_8_points_of_a_scan_with_no_metadata_are_refused(self, profile):
+        meta = pq.read_table(profile / "scan_metadata.parquet")
+        pq.write_table(meta.filter(pa.compute.not_equal(meta["scan"], 3)), profile / "scan_metadata.parquet")
+        with pytest.raises(ValueError, match="no scan metadata"):
+            average_bundle(profile)

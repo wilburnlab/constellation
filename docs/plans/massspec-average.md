@@ -1,6 +1,6 @@
 # Averaging a direct-infusion run (`massspec average`)
 
-Status: PR #114 (Jeanie Edgington, 2026-11-19), reviewed and refined on the same branch on 2026-11-20: five commits, P1–P5. Code in `constellation/massspec/average.py`; the kind-of-scan key in `massspec.acquisition_structure.scan_kinds`; the bundle rules in `massspec.bundle`.
+Status: PR #114 (Jeanie Edgington, 2026-11-19), reviewed and refined on the same branch on 2026-11-20 (five commits, P1–P5), then reviewed by Codex on 2026-11-21 (one commit, below). Code in `constellation/massspec/average.py`; the kind-of-scan key in `massspec.acquisition_structure.scan_kinds`; the bundle rules in `massspec.bundle`.
 
 ## What it does
 
@@ -27,7 +27,7 @@ A direct-infusion run repeats the same scans for its whole acquisition, so every
    - the mean time and TIC, the median injection time and the mean spectrum's base peak;
    - other columns only where every replicate agrees;
    - null for one scan's readings and for scan numbers.
-4. **A bundle made from another replaces only what it made** (`prepare_derived_bundle` / `finish_derived_bundle`, used by `average` and `centroid`):
+4. **A bundle made from another replaces only what it made** (`derived_bundle_writer`, used by `average` and `centroid`):
    - it is written into a hidden sibling directory and renamed into place when whole;
    - only a finished bundle made from the same source is replaced, and only with `--force`;
    - nothing else is ever removed.
@@ -76,3 +76,35 @@ The first three rows are the whole average (the pass that finds each kind's exte
 - **A directory is averaged one run at a time.**
 - **The browser opens an average as an acquisition of its own:** a chromatogram of one point per kind, which is harmless.
 - **Still to do:** re-run the 261118 RNA infusion set (69 runs, on OSC) with the refined code.
+
+## Review by Codex (2026-11-21)
+
+Codex reviewed the refined branch and found seven defects and one defensive gap. Each is reproduced by a case in `tests/test_massspec_average.py::TestCodexReview` that fails on the code before the fix (`c1a4e11`).
+
+1. **The new index did not reach two consumers.**
+   - The browser grouped attached bundles by hash alone, so a run and its average were one acquisition.
+   - `results.acquisition_bundles` took an average's peak list for the searched run's peaks.
+   - Fix: both now count only bundles numbered alike (`scans.AcquisitionInfo.spectrum_index`; `results._bundle_manifest`).
+2. **Concurrent writers.** Every writer staged into the same hidden directory and removed it first, so a second run of the command deleted the first one's work, `--force` or not.
+   - Fix: `derived_bundle_writer` holds a lock beside the output (`core.locks`, as searches and reports do) from staging to publication. A second writer is refused at once, and what may be replaced is checked again at publication.
+3. **Directory mode trusted any `manifest.json`**, so another run of the same name, or a manifest of `{}`, counted as "already averaged".
+   - Fix: a run is skipped only when a finished, current-format average made from that same run is there.
+4. **Skipped scans set the grid.** The origin and step were read from every scan, `--skip-first`'s included, so a skipped first fill off the grid put every kept point off it.
+   - Fix: the grid is read from the averaged scans only.
+5. **One endpoint off the grid moved the grid.** The origin was the lowest first point of any scan, so an endpoint half a step low put 749 of 750 points off the grid.
+   - Fix: the grid is fitted to the first averaged scan, the step from its span refined by least squares over every point numbered from the scan's middle. It is extended in whole steps to every averaged scan's ends that lie on it; an endpoint off it extends nothing and is counted.
+   - On the benchmarks, means, SDs and counts are bit-identical to before, and m/z moved by at most 4.5e-13.
+6. **Finishing held everything at once:** every output-sized array, and the whole peak table before it was written.
+   - Fix: the average is now finished and written a group of whole kinds at a time (`FINISH_POINTS`, 2^20 grid points). Peak memory, 58.5M synthetic points:
+
+     | Kinds × replicates | Before | After |
+     |---|---|---|
+     | 10 × 300 | 0.84 GB | 0.84 GB |
+     | 300 × 10 | 1.60 GB | 1.07 GB |
+     | 1,000 × 3 | 3.87 GB | 1.40 GB |
+7. **A failed publication lost the old output.** The old bundle was moved aside before the new one was renamed into place, with no way back.
+   - Fix: it is put back if the rename fails.
+
+Also:
+- **Points of a scan with no scan metadata are refused.** Before, they indexed the last row and joined that row's kind, which could leak signal across FAIMS kinds.
+- **Unknown values in the summary are null, not NaN:** for instance, the median injection time of no skipped scans.

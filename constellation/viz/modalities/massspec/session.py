@@ -148,15 +148,19 @@ class MassSpecSession:
         by_content: dict[str, str] = {}
 
         def add(described: MsAcquisition) -> str:
+            # The run's content and what its spectra count: an average of a
+            # run (one spectrum per kind of scan) carries the run's hash but
+            # is not its scans, so it is an acquisition of its own.
             sha = described.info.get("source_sha256")
-            slot = by_content.get(sha) if sha else None
+            content = f"{sha}:{described.info.get('spectrum_index', 'scan')}" if sha else None
+            slot = by_content.get(content) if content else None
             if slot is not None:
                 acquisitions[slot] = _merged(acquisitions[slot], described)
                 return slot
             slot = described.key
             acquisitions.setdefault(slot, described)  # the same bundle attached twice
-            if sha:
-                by_content[sha] = slot
+            if content:
+                by_content[content] = slot
             return slot
 
         bundles = [s for s in built if s.kind == "acquisition"]
@@ -315,6 +319,7 @@ def _assembled(family: list[dict[str, Any]], *, label: str, source_id: str, link
             "scans_per_level": {str(k): v for k, v in info.scans_per_level.items()},
             "analyzers": {str(k): list(v) for k, v in info.analyzers.items()},
             "rt_range": list(info.rt_range),
+            "spectrum_index": info.spectrum_index,
             "has_index": info.index is not None,
             "default_tolerance": tolerance,
             "peak_lists": [

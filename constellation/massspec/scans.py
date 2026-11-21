@@ -128,6 +128,10 @@ class AcquisitionInfo:
     #: them only for the whole run, so every level gets that list.
     analyzers: dict[int, tuple[str, ...]]
     rt_range: tuple[float, float]
+    #: What its spectrum numbers count (``bundle.spectrum_index``): ``scan``
+    #: for a run's scans in time, ``kind_of_scan`` for an average. Bundles of
+    #: one run count alike only within one index.
+    spectrum_index: str = SCAN_INDEX
 
 
 def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
@@ -184,6 +188,7 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
         scans_per_level=counts,
         analyzers=analyzers,
         rt_range=rt_range,
+        spectrum_index=spectrum_index(manifest),
     )
 
 

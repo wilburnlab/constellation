@@ -44,11 +44,10 @@ from constellation.massspec.bundle import (
     SCAN_INDEX,
     SPECTRUM_INDEX_KEY,
     PeakWriter,
-    finish_derived_bundle,
+    derived_bundle_writer,
     is_profile_bundle,
     part_name,
     peak_rows,
-    prepare_derived_bundle,
     read_bundle_manifest,
     spectrum_index,
 )
@@ -283,16 +282,15 @@ def centroid_bundle(
     # is replaced only with force and only once the new one is finished, and
     # nothing else there is ever removed (until 2026-11-20 `-o DIR --force`
     # removed whatever DIR was).
-    out = prepare_derived_bundle(final, source, force=force)
-    (out / PEAKS_DIR).mkdir()
-    parts = sorted((source / PROFILE_DIR).glob("part-*.parquet"))
-    # What a worker reads per scan: the verbatim trailer is most of the table.
-    narrow = scan_table.select([c for c in scan_table.column_names if c != "trailer_extras"])
-    tasks = [
-        (str(p), str(out / PEAKS_DIR / part_name(i)), algorithm, parameters, narrow, chosen, rt_bin_width_s)
-        for i, p in enumerate(parts)
-    ]
-    try:
+    with derived_bundle_writer(final, source, force=force) as out:
+        (out / PEAKS_DIR).mkdir()
+        parts = sorted((source / PROFILE_DIR).glob("part-*.parquet"))
+        # What a worker reads per scan: the verbatim trailer is most of the table.
+        narrow = scan_table.select([c for c in scan_table.column_names if c != "trailer_extras"])
+        tasks = [
+            (str(p), str(out / PEAKS_DIR / part_name(i)), algorithm, parameters, narrow, chosen, rt_bin_width_s)
+            for i, p in enumerate(parts)
+        ]
         if workers <= 1 or len(tasks) <= 1:
             results = [_make_part_star(t) for t in tasks]
         else:
@@ -358,7 +356,4 @@ def centroid_bundle(
         if precursor_major:
             build_precursor_major(out, workers=workers)
         (out / MANIFEST_FILENAME).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    except BaseException:
-        shutil.rmtree(out, ignore_errors=True)
-        raise
-    return finish_derived_bundle(out, final)
+    return final

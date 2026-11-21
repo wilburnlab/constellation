@@ -35,6 +35,7 @@ current, because what its files mean has changed.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -257,20 +258,10 @@ def _made_from(directory: Path, source: Path) -> bool:
     )
 
 
-def prepare_derived_bundle(out: Path | str, source: Path | str, *, force: bool) -> Path:
-    """A new, hidden directory beside ``out`` to write a bundle made from
-    ``source`` into; :func:`finish_derived_bundle` then puts it at ``out``.
-
-    Nothing at ``out`` is touched here, and only what is safe is ever
-    replaced: never ``source`` or a directory holding it; with ``force``, a
-    finished bundle made from ``source`` (its manifest's ``derived_from``
-    names it); an empty directory. Anything else is refused, ``force`` or
-    not, as not this command's to remove. A leftover from a run that was
-    killed is cleared.
-    """
-    out, source = Path(out), Path(source)
-    if out.resolve() == source.resolve() or source.resolve().is_relative_to(out.resolve()):
-        raise ValueError(f"{out} holds {source}: what is made from it cannot be written there")
+def _check_replaceable(out: Path, source: Path, force: bool) -> None:
+    """Refuse to put a bundle made from ``source`` at ``out`` unless what is
+    there may be replaced: nothing, an empty directory, or with ``force`` a
+    finished bundle made from ``source``."""
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         if not _made_from(out, source):
             raise FileExistsError(
@@ -279,27 +270,68 @@ def prepare_derived_bundle(out: Path | str, source: Path | str, *, force: bool) 
             )
         if not force:
             raise FileExistsError(f"already there: {out} (pass --force to make it again)")
-    partial = out.with_name(f".{out.name}.partial")
-    if partial.exists():
-        shutil.rmtree(partial)
-    partial.mkdir(parents=True)
-    return partial
 
 
-def finish_derived_bundle(partial: Path | str, out: Path | str) -> Path:
-    """Put the bundle written in ``partial`` (:func:`prepare_derived_bundle`)
-    at ``out``, replacing what is there only now that the new one is whole."""
-    partial, out = Path(partial), Path(out)
-    if out.exists():
-        replaced = out.with_name(f".{out.name}.replaced")
-        if replaced.exists():
-            shutil.rmtree(replaced)
-        os.replace(out, replaced)
-        os.replace(partial, out)
-        shutil.rmtree(replaced, ignore_errors=True)
-    else:
-        os.replace(partial, out)
-    return out
+def _publish(staged: Path, out: Path) -> None:
+    """Rename ``staged`` to ``out``; what was at ``out`` goes only once the
+    new bundle is in place, and comes back if it cannot be put there."""
+    if not out.exists():
+        os.replace(staged, out)
+        return
+    replaced = out.with_name(f".{out.name}.replaced")
+    if replaced.exists():
+        shutil.rmtree(replaced)
+    os.replace(out, replaced)
+    try:
+        os.replace(staged, out)
+    except BaseException:
+        os.replace(replaced, out)
+        raise
+    shutil.rmtree(replaced, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def derived_bundle_writer(out: Path | str, source: Path | str, *, force: bool) -> Iterator[Path]:
+    """Write a bundle made from ``source`` that is to end up at ``out``:
+    yields a new, hidden directory beside ``out`` to write it into, and puts
+    it at ``out`` when the block ends without an error (removing it when it
+    ends with one).
+
+    One writer at a time: a lock beside ``out`` (``.<name>.lock``) is held
+    from the start to the end, and a second writer is refused at once rather
+    than let in to clear the first one's work. Only what is safe is ever
+    replaced, checked when the block starts and again before the new bundle
+    is put in place: never ``source`` or a directory holding it; nothing,
+    or an empty directory; with ``force``, a finished bundle made from
+    ``source`` (its manifest's ``derived_from`` names it). Anything else is
+    refused, ``force`` or not, as not this command's to remove. The old
+    bundle is removed only once the new one is in place, and stays if it
+    cannot be. What a killed writer left is cleared by the next.
+    """
+    from constellation.core.locks import LockHeld, file_lock
+
+    out, source = Path(out), Path(source)
+    if out.resolve() == source.resolve() or source.resolve().is_relative_to(out.resolve()):
+        raise ValueError(f"{out} holds {source}: what is made from it cannot be written there")
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(file_lock(out.with_name(f".{out.name}.lock"), wait=False))
+        except LockHeld:
+            raise FileExistsError(
+                f"{out} is being written by another process; run this again once it has finished"
+            ) from None
+        _check_replaceable(out, source, force)
+        staged = out.with_name(f".{out.name}.partial")
+        if staged.exists():  # a killed writer's: the lock says no other is running
+            shutil.rmtree(staged)
+        staged.mkdir(parents=True)
+        try:
+            yield staged
+            _check_replaceable(out, source, force)
+            _publish(staged, out)
+        except BaseException:
+            shutil.rmtree(staged, ignore_errors=True)
+            raise
 
 
 def part_name(index: int) -> str:
@@ -742,7 +774,7 @@ __all__ = [
     "PeakWriter",
     "SCAN_INDEX",
     "SPECTRUM_INDEX_KEY",
-    "finish_derived_bundle",
+    "derived_bundle_writer",
     "has_peaks",
     "is_profile_bundle",
     "iter_peak_batches",
@@ -755,7 +787,6 @@ __all__ = [
     "peaks_dataset",
     "point_paths",
     "points_dataset",
-    "prepare_derived_bundle",
     "read_bundle_manifest",
     "related_bundles",
     "require_scans",

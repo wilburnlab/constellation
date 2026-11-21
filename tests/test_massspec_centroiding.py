@@ -167,7 +167,7 @@ class TestCentroidBundle:
         with pytest.raises(RuntimeError):
             centroid_bundle(profile, "apex", force=True, precursor_major=False)
         assert (out / "manifest.json").read_text() == before
-        assert [p.name for p in out.parent.iterdir() if p.name.startswith(".")] == []
+        assert [p.name for p in out.parent.iterdir() if p.name.startswith(".") and not p.name.endswith(".lock")] == []
 
     def test_it_takes_only_a_profile_bundle(self, tmp_path):
         peaks = write_bundle_manifest(write_bundle(tmp_path, "run", _scans(5), row_group_size=4096))
