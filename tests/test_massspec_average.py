@@ -597,3 +597,21 @@ class TestCommandReports:
         (b / "manifest.json").write_text(json.dumps(manifest))
         assert self._run(str(d)) == 5
         assert "0 averaged, 0 skipped, 1 failed" in capsys.readouterr().err
+
+
+def test_summarize_describes_the_average_not_the_run(tmp_path):
+    """Found averaging RF30: summarize called 101 averaged spectra a DDA run
+    and quoted the run's 31,300 scans with a blank trailer."""
+    from constellation.massspec.bundle_summary import summarize_bundle
+
+    scans = _scans()
+    for s in scans:
+        if s["level"] == 1 and s["filter_string"].startswith("ITMS - "):
+            s["iit"] = None  # a blank trailer on every scan of one kind
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "s.profile", scans, profile=True), run="s")
+    run = json.loads((bundle / "manifest.json").read_text())
+    run["run_metadata"]["n_scans_without_injection_time"] = 5
+    (bundle / "manifest.json").write_text(json.dumps(run))
+    summary = summarize_bundle(average_bundle(bundle))
+    assert summary["acquisition_type"] is None
+    assert summary["n_scans_without_injection_time"] == 1  # one kind of scan, not the run's five scans

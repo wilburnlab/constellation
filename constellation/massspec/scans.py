@@ -51,12 +51,14 @@ from constellation.massspec.acquisition_structure import (
 )
 from constellation.massspec.bundle import (
     BUNDLE_KINDS,
+    SCAN_INDEX,
     is_profile_bundle,
     list_mz_axes,
     peak_list_name,
     points_dataset,
     read_bundle_manifest,
     related_bundles,
+    spectrum_index,
 )
 from constellation.massspec.quant.peak_index import (
     find_peak_index,
@@ -155,6 +157,8 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
         analyzers[level] = seen or run_analyzers
 
     try:
+        if spectrum_index(manifest) != SCAN_INDEX:  # an average: one spectrum per kind, no acquisition scheme
+            raise ValueError("not a run's scans")
         structure = infer_acquisition_structure(meta)
         acquisition_type, staggered = structure.acquisition_type, structure.is_staggered
     except ValueError:  # no MS2 scans, or none with isolation bounds

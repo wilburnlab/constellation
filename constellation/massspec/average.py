@@ -300,6 +300,11 @@ def _drift(kind: np.ndarray, order_key: np.ndarray, tic: np.ndarray, n_kinds: in
     return out
 
 
+def _known(values: np.ndarray) -> pa.Array:
+    """Floats with NaN as null: a value no replicate recorded is unknown."""
+    return pa.array(values, mask=~np.isfinite(values))
+
+
 def _column(scans: pa.Table, name: str) -> np.ndarray:
     if name not in scans.column_names:
         return np.full(scans.num_rows, np.nan)
@@ -510,9 +515,9 @@ def _average_into(partial: Path, source: Path, manifest: dict, out: Path, skip_f
     measured = {
         "scan": pa.array(np.arange(1, n_kinds + 1, dtype=np.int32)),
         "rt": pa.array(_mean(kind[kept], _column(scans, "rt")[kept], n_kinds)),
-        "tic": pa.array(_mean(kind[kept], _column(scans, "tic")[kept], n_kinds)),
-        "iit": pa.array(_quantile(kind[kept], _column(scans, "iit")[kept], n_kinds, 0.5)),
-        "base_peak_mz": pa.array(bp_mz),
+        "tic": _known(_mean(kind[kept], _column(scans, "tic")[kept], n_kinds)),
+        "iit": _known(_quantile(kind[kept], _column(scans, "iit")[kept], n_kinds, 0.5)),
+        "base_peak_mz": _known(bp_mz),
         "base_peak_intensity": pa.array(bp_int),
         "peak_count": pa.array(n_points),
     }
@@ -568,6 +573,10 @@ def _average_into(partial: Path, source: Path, manifest: dict, out: Path, skip_f
             "n_scans_skipped": int((~kept).sum()),
             "n_points_read": n_read,
             "n_points_off_grid": int(off_per_kind.sum()),
+            # Of the averaged spectra, as summarize reads it: kinds whose
+            # scans recorded no injection time (the run's own count of
+            # scans is not the average's).
+            "n_scans_without_injection_time": int(rep.column("iit").null_count),
         },
         "derived_from": {
             "name": SUFFIX,
