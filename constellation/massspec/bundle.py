@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+import shutil
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -129,6 +131,33 @@ def _check_current(bundle: Path) -> None:
     _refuse_outdated(bundle, {"schema_version": _manifest_version(str(path), mtime_ns)})
 
 
+#: What a bundle's spectrum numbers count, in its manifest. A run's bundles
+#: (a conversion, its profile, the peak lists made from either) number its
+#: scans in time, and say nothing; an average numbers kinds of scan, one
+#: spectrum each. Bundles that number their spectra differently are not the
+#: same scans in another form, so they are never tied into one run's family,
+#: and what needs scans in time (a sweep, a search, the spectra file) refuses
+#: anything else.
+SPECTRUM_INDEX_KEY = "spectrum_index"
+SCAN_INDEX = "scan"
+KIND_OF_SCAN_INDEX = "kind_of_scan"
+_INDEX_DESCRIPTIONS = {KIND_OF_SCAN_INDEX: "one averaged spectrum per kind of scan"}
+
+
+def spectrum_index(manifest: Mapping[str, Any]) -> str:
+    """What a bundle's spectrum numbers count: :data:`SCAN_INDEX` unless its
+    manifest says otherwise."""
+    return str(manifest.get(SPECTRUM_INDEX_KEY) or SCAN_INDEX)
+
+
+def require_scans(manifest: Mapping[str, Any], bundle: Path | str, where: str) -> None:
+    """Raise ``ValueError`` unless the bundle numbers a run's scans in time."""
+    index = spectrum_index(manifest)
+    if index != SCAN_INDEX:
+        held = _INDEX_DESCRIPTIONS.get(index, f"spectra numbered by {index!r}")
+        raise ValueError(f"{bundle} holds {held}, not a run's scans in time; {where} needs a run's scans")
+
+
 def list_mz_axes(bundle_dir: Path | str) -> list[str]:
     """The keys of a bundle's measured m/z curves, oldest first."""
     directory = Path(bundle_dir) / MZ_AXES_DIR
@@ -165,7 +194,9 @@ def related_bundles(bundle_dir: Path | str) -> list[dict[str, Any]]:
     named for the run whose manifest has the same ``source_sha256``, or which
     are tied to this bundle by naming each other, directly or through another
     of the run's bundles (a conversion with no hash: a derived list names the
-    profile, and the profile names the conversion's peak list). Each is
+    profile, and the profile names the conversion's peak list). Only bundles
+    whose spectra are numbered as this one's are (:func:`spectrum_index`): an
+    average of the run, and its peak lists, are not the run's scans. Each is
     ``name``, ``bundle``, ``holds_profile`` and ``mz_axes``. A bundle in an
     older format is passed over."""
     bundle = Path(bundle_dir).resolve()
@@ -173,6 +204,7 @@ def related_bundles(bundle_dir: Path | str) -> list[dict[str, Any]]:
     source = str(manifest.get("source_file") or bundle.name).replace("\\", "/").rsplit("/", 1)[-1]
     run = Path(source).stem
     sha = manifest.get("source_sha256")
+    index = spectrum_index(manifest)
     candidates: dict[Path, Mapping[str, Any]] = {}
     for candidate in sorted(bundle.parent.iterdir()):
         if candidate == bundle or not candidate.is_dir():
@@ -180,9 +212,11 @@ def related_bundles(bundle_dir: Path | str) -> list[dict[str, Any]]:
         if candidate.name != run and not candidate.name.startswith(run + "."):
             continue
         try:
-            candidates[candidate] = read_bundle_manifest(candidate)
+            other = read_bundle_manifest(candidate)
         except (ValueError, OSError):
             continue
+        if spectrum_index(other) == index:
+            candidates[candidate] = other
 
     tied = {c for c, other in candidates.items() if sha and other.get("source_sha256") == sha}
     reached = [(bundle, manifest), *((c, candidates[c]) for c in tied)]
@@ -201,6 +235,71 @@ def related_bundles(bundle_dir: Path | str) -> list[dict[str, Any]]:
         }
         for c in sorted(tied)
     ]
+
+
+# ── writing a bundle made from another ────────────────────────────────
+
+
+def _made_from(directory: Path, source: Path) -> bool:
+    """Whether ``directory`` is a bundle whose manifest says it was made from
+    ``source`` (in any format: an older one is still ours to replace)."""
+    try:
+        manifest = json.loads((directory / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    named = (manifest.get("derived_from") or {}).get("source")
+    return (
+        manifest.get("kind") in BUNDLE_KINDS
+        and bool(named)
+        and (directory.parent / str(named)).resolve() == source.resolve()
+    )
+
+
+def prepare_derived_bundle(out: Path | str, source: Path | str, *, force: bool) -> Path:
+    """A new, hidden directory beside ``out`` to write a bundle made from
+    ``source`` into; :func:`finish_derived_bundle` then puts it at ``out``.
+
+    Nothing at ``out`` is touched here, and only what is safe is ever
+    replaced: never ``source`` or a directory holding it; with ``force``, a
+    finished bundle made from ``source`` (its manifest's ``derived_from``
+    names it); an empty directory. Anything else is refused, ``force`` or
+    not, as not this command's to remove. A leftover from a run that was
+    killed is cleared.
+    """
+    out, source = Path(out), Path(source)
+    if out.resolve() == source.resolve() or source.resolve().is_relative_to(out.resolve()):
+        raise ValueError(f"{out} holds {source}: what is made from it cannot be written there")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        if not _made_from(out, source):
+            raise FileExistsError(
+                f"{out} is there and is not a bundle made from {source.name}; it is not removed, even "
+                f"with --force: choose another output directory, or remove it yourself"
+            )
+        if not force:
+            raise FileExistsError(f"already there: {out} (pass --force to make it again)")
+    partial = out.with_name(f".{out.name}.partial")
+    if partial.exists():
+        shutil.rmtree(partial)
+    partial.mkdir(parents=True)
+    return partial
+
+
+def finish_derived_bundle(partial: Path | str, out: Path | str) -> Path:
+    """Put the bundle written in ``partial`` (:func:`prepare_derived_bundle`)
+    at ``out``, replacing what is there only now that the new one is whole."""
+    partial, out = Path(partial), Path(out)
+    if out.exists():
+        replaced = out.with_name(f".{out.name}.replaced")
+        if replaced.exists():
+            shutil.rmtree(replaced)
+        os.replace(out, replaced)
+        os.replace(partial, out)
+        shutil.rmtree(replaced, ignore_errors=True)
+    else:
+        os.replace(partial, out)
+    return out
 
 
 def part_name(index: int) -> str:
@@ -630,6 +729,7 @@ __all__ = [
     "BUNDLE_KINDS",
     "BUNDLE_SCHEMA_VERSION",
     "DEFAULT_RT_BIN_WIDTH_S",
+    "KIND_OF_SCAN_INDEX",
     "MANIFEST_FILENAME",
     "MAX_ROW_GROUP_ROWS",
     "MZ_AXES_DIR",
@@ -640,6 +740,9 @@ __all__ = [
     "PROFILE_DIR",
     "PROFILE_SUFFIX",
     "PeakWriter",
+    "SCAN_INDEX",
+    "SPECTRUM_INDEX_KEY",
+    "finish_derived_bundle",
     "has_peaks",
     "is_profile_bundle",
     "iter_peak_batches",
@@ -652,6 +755,9 @@ __all__ = [
     "peaks_dataset",
     "point_paths",
     "points_dataset",
+    "prepare_derived_bundle",
     "read_bundle_manifest",
     "related_bundles",
+    "require_scans",
+    "spectrum_index",
 ]

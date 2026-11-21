@@ -44,6 +44,7 @@ from constellation.massspec.bundle import (
     ScanBlock,
     iter_scan_blocks,
     read_bundle_manifest,
+    require_scans,
     scan_range_shards,
 )
 from constellation.massspec.sweep.claims import Claims, claims_table, find_claims
@@ -788,6 +789,8 @@ def sweep(
     queries in precursor m/z order (``x.massspec.sweep.layout`` in its
     metadata), and the in-memory matches are not kept (``matches`` None).
     """
+    if not isinstance(source, pa.Table):  # either layout: a sweep matches a run's scans in time
+        require_scans(read_bundle_manifest(Path(source)), source, "a sweep")
     _check_outputs(reducers, settings)
     _check_gate(plan, settings)
     if layout not in LAYOUTS:

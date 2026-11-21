@@ -35,7 +35,14 @@ def _build_centroid_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument("--stride", type=int, default=None, help="Pick every Nth scan only: a partial list for looking at, which cannot be searched.")
     p.add_argument("--scans", type=Path, default=None, help="Pick these scans only (one number per line): a partial list, as --stride.")
     p.add_argument("--threads", type=int, default=None, help="Worker processes (default: the cores, up to 8).")
-    p.add_argument("--force", action="store_true", help="Make it again if it is already there.")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Make it again if it is already there. Only a peak list made from this profile is ever "
+            "replaced, and only once the new one is finished; anything else there is refused."
+        ),
+    )
     p.set_defaults(func=_cmd_massspec_centroid)
 
 

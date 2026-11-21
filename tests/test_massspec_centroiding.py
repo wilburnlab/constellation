@@ -144,6 +144,31 @@ class TestCentroidBundle:
         centroid_bundle(profile, "apex", force=True)
         assert not (out / "stale").exists()
 
+    def test_force_removes_nothing_but_a_list_of_this_profile(self, profile, tmp_path):
+        # Until 2026-11-20 `-o DIR --force` removed whatever DIR was: the
+        # profile's own parent, with the profile in it, included.
+        (tmp_path / "notes.txt").write_text("keep")
+        with pytest.raises(ValueError, match="holds"):
+            centroid_bundle(profile, "apex", output_dir=tmp_path, force=True)
+        other = tmp_path / "results"
+        other.mkdir()
+        (other / "figure.svg").write_text("keep")
+        with pytest.raises(FileExistsError, match="not a bundle made from"):
+            centroid_bundle(profile, "apex", output_dir=other, force=True)
+        assert (tmp_path / "notes.txt").read_text() == "keep" and (other / "figure.svg").read_text() == "keep"
+        assert (profile / "manifest.json").is_file()
+
+    def test_a_failed_forced_rerun_keeps_the_list_there(self, profile, monkeypatch):
+        from constellation.massspec.centroiding import driver
+
+        out = centroid_bundle(profile, "apex", precursor_major=False)
+        before = (out / "manifest.json").read_text()
+        monkeypatch.setattr(driver.shutil, "copy2", lambda *_, **__: (_ for _ in ()).throw(RuntimeError("no")))
+        with pytest.raises(RuntimeError):
+            centroid_bundle(profile, "apex", force=True, precursor_major=False)
+        assert (out / "manifest.json").read_text() == before
+        assert [p.name for p in out.parent.iterdir() if p.name.startswith(".")] == []
+
     def test_it_takes_only_a_profile_bundle(self, tmp_path):
         peaks = write_bundle_manifest(write_bundle(tmp_path, "run", _scans(5), row_group_size=4096))
         with pytest.raises(ValueError, match="holds peaks"):
@@ -192,6 +217,17 @@ class TestThroughConvert:
         assert m.kind == "thermo_acquisition" and m.parameters["centroider"] == "apex"
         assert (tmp_path / "run.profile" / "manifest.json").is_file()
         assert spectrum(tmp_path / "run", 1).column("mz").to_numpy() == pytest.approx([404.0], abs=1e-3)
+
+    def test_a_forced_conversion_replaces_an_earlier_conversions_list(self, src, tmp_path):
+        from constellation.massspec.readers.thermo import convert
+
+        convert(src, tmp_path / "run")  # Thermo's centroider: a list made from no profile bundle
+        (tmp_path / "run" / "notes.txt").write_text("keep")
+        with pytest.raises(FileExistsError, match="not a bundle made from"):  # not convert's to remove
+            convert(src, tmp_path / "run", centroid_algo="apex", force=True)
+        (tmp_path / "run" / "notes.txt").unlink()
+        m = convert(src, tmp_path / "run", centroid_algo="apex", force=True)
+        assert m.parameters["centroider"] == "apex"
 
     def test_without_the_profile_it_is_removed_once_the_list_is_made(self, src, tmp_path):
         from constellation.massspec.readers.thermo import convert
