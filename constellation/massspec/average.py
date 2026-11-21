@@ -33,7 +33,14 @@ sampled across the same stretch of time.
 What it writes is a profile bundle (``profile/``, scan and acquisition
 metadata, a manifest written last naming its source), one spectrum per kind
 of scan, so the commands that read a profile bundle read it: ``massspec
-centroid`` makes a peak list from it. Beside that it keeps what has no column
+centroid`` makes a peak list from it. Its spectra are numbered by kind of
+scan, not by scan, and its manifest says so (``spectrum_index``): it is not
+one of the run's bundles (``bundle.related_bundles``), it is not an
+acquisition to register, and a sweep, a spectra file or a precursor-major
+layout refuses it. Its scan metadata holds what is true of each average: the
+columns that define the kind, the mean time and TIC, the median injection
+time and the mean spectrum's base peak, method settings that every replicate
+shares, and null for one scan's readings. Beside that it keeps what has no column
 in the peak table: each point's standard deviation and number of replicates
 (``average_points/``, :data:`AVERAGE_POINTS_TABLE`) and each spectrum's
 replicates, injection-time and TIC summaries (``average_summary.parquet``,
@@ -56,15 +63,18 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from constellation.core.io.schemas import register_schema
-from constellation.massspec.acquisition_structure import scan_kinds
+from constellation.massspec.acquisition_structure import KIND_NUMBER_COLUMNS, KIND_TEXT_COLUMNS, scan_kinds
 from constellation.massspec.bundle import (
     BUNDLE_SCHEMA_VERSION,
+    KIND_OF_SCAN_INDEX,
     MANIFEST_FILENAME,
     PROFILE_BUNDLE_KIND,
     PROFILE_DIR,
+    SPECTRUM_INDEX_KEY,
     PeakWriter,
     is_profile_bundle,
     iter_scan_blocks,
@@ -347,6 +357,57 @@ def _summary(scans, kind, kept, n_kinds, rep, origin, step, n_points, incomplete
     )
 
 
+#: Columns no averaged spectrum has a value for: one scan's trailer as the
+#: instrument wrote it, the lowest intensity one scan stored, and the scans
+#: a scan was taken from, by a number that means nothing among kinds of scan.
+_NOT_OF_AN_AVERAGE = ("trailer_extras", "intensity_floor", "precursor_scan", "master_scan")
+
+
+def _agrees(a: pa.Array, b: pa.Array) -> np.ndarray:
+    """Element by element, whether ``a`` and ``b`` hold the same value (two
+    nulls do)."""
+    both_null = a.is_null().to_numpy(zero_copy_only=False) & b.is_null().to_numpy(zero_copy_only=False)
+    try:
+        same = pc.fill_null(pc.equal(a, b), False).to_numpy(zero_copy_only=False)
+    except (pa.ArrowNotImplementedError, pa.ArrowTypeError):  # a nested column (scan windows)
+        return np.array([x == y for x, y in zip(a.to_pylist(), b.to_pylist())], dtype=bool)
+    return same | both_null
+
+
+def _kind_metadata(scans: pa.Table, kind: np.ndarray, kept: np.ndarray, n_kinds: int, measured: dict) -> pa.Table:
+    """One row of scan metadata per kind of scan, every value true of its
+    average: the columns that define a kind (``acquisition_structure``'s
+    key) from its first averaged scan; ``measured`` (the spectrum's number,
+    mean time and TIC, median injection time, base peak, point count) as
+    given; :data:`_NOT_OF_AN_AVERAGE` null; and every other column only where
+    all the averaged scans of the kind hold the same value (a method setting),
+    else null (an AGC reading, a scan event's index)."""
+    kept_rows = np.flatnonzero(kept)
+    k_kept = kind[kept_rows]
+    first = np.full(n_kinds, np.iinfo(np.int64).max, np.int64)
+    np.minimum.at(first, k_kept, kept_rows)
+    rep = scans.take(pa.array(first))
+    replicates = scans.take(pa.array(kept_rows))
+    defining = set(KIND_TEXT_COLUMNS) | {name for name, _ in KIND_NUMBER_COLUMNS}
+    for at, field in enumerate(rep.schema):
+        name = field.name
+        if name in measured:
+            values = measured[name].cast(field.type)
+        elif name in _NOT_OF_AN_AVERAGE:
+            values = pa.nulls(n_kinds, field.type)
+        elif name in defining:
+            continue
+        else:
+            column = rep.column(name).combine_chunks()
+            agree = _agrees(replicates.column(name).combine_chunks(), column.take(pa.array(k_kept)))
+            same = np.bincount(k_kept, ~agree, n_kinds) == 0
+            if same.all():
+                continue
+            values = pa.array([v if s else None for v, s in zip(column.to_pylist(), same.tolist())], field.type)
+        rep = rep.set_column(at, field, values)
+    return rep
+
+
 # ── one run ───────────────────────────────────────────────────────────
 
 
@@ -429,33 +490,22 @@ def average_bundle(
     n_read = int(count.sum() + off_per_kind.sum())
 
     # ── one row of scan metadata per averaged spectrum ────────────────
-    kept_rows = np.flatnonzero(kept)
-    first_kept = np.full(n_kinds, np.iinfo(np.int64).max, np.int64)
-    np.minimum.at(first_kept, kind[kept_rows], kept_rows)
-    rep = scans.take(pa.array(first_kept))
     starts = np.concatenate(([0], np.cumsum(n_points)[:-1]))
     bp_mz = np.full(n_kinds, np.nan)
     bp_int = np.zeros(n_kinds)
     for i in np.flatnonzero(n_points):  # one argmax per averaged spectrum
         j = starts[i] + int(np.argmax(mean[starts[i] : starts[i] + n_points[i]]))
         bp_mz[i], bp_int[i] = mz[j], mean[j]
-    replace = {
+    measured = {
         "scan": pa.array(np.arange(1, n_kinds + 1, dtype=np.int32)),
         "rt": pa.array(_mean(kind[kept], _column(scans, "rt")[kept], n_kinds)),
         "tic": pa.array(_mean(kind[kept], _column(scans, "tic")[kept], n_kinds)),
-        "iit": pa.array(_quantile(kind[kept], _column(scans, "iit")[kept], n_kinds, 0.5), pa.float32()),
+        "iit": pa.array(_quantile(kind[kept], _column(scans, "iit")[kept], n_kinds, 0.5)),
         "base_peak_mz": pa.array(bp_mz),
         "base_peak_intensity": pa.array(bp_int),
-        "peak_count": pa.array(n_points, pa.uint32()),
-        "intensity_floor": pa.nulls(n_kinds, pa.float64()),
+        "peak_count": pa.array(n_points),
     }
-    if "trailer_extras" in rep.column_names:  # a verbatim trailer is one scan's; an average has none
-        replace["trailer_extras"] = pa.nulls(n_kinds, rep.schema.field("trailer_extras").type)
-    for name, values in replace.items():
-        if name not in rep.column_names:
-            continue
-        at = rep.schema.get_field_index(name)
-        rep = rep.set_column(at, rep.schema.field(name), values.cast(rep.schema.field(name).type))
+    rep = _kind_metadata(scans, kind, kept, n_kinds, measured)
     summary = _summary(scans, kind, kept, n_kinds, rep, origin, step, n_points, incomplete, off_per_kind)
 
     # ── write ─────────────────────────────────────────────────────────
@@ -486,6 +536,9 @@ def average_bundle(
         record = {
             "schema_version": BUNDLE_SCHEMA_VERSION,
             "kind": PROFILE_BUNDLE_KIND,
+            # Its spectra are kinds of scan, not the run's scans: it is no
+            # member of the run's family, and sweeps and searches refuse it.
+            SPECTRUM_INDEX_KEY: KIND_OF_SCAN_INDEX,
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source_file": manifest.get("source_file"),
             "source_sha256": manifest.get("source_sha256"),

@@ -514,13 +514,14 @@ def acquisition_record_from_bundle(bundle_dir: Path | str) -> dict[str, object]:
     the source file, its hash (when it was computed) and the instrument.
     Feed the result to :meth:`Acquisitions.register`.
     """
-    from constellation.massspec.bundle import read_bundle_manifest
+    from constellation.massspec.bundle import read_bundle_manifest, require_scans
 
     if not (Path(bundle_dir) / "manifest.json").is_file():
         raise FileNotFoundError(
             f"{Path(bundle_dir)} has no manifest.json: not a converted acquisition bundle"
         )
     manifest = read_bundle_manifest(bundle_dir)
+    require_scans(manifest, bundle_dir, "an acquisition")
     source = manifest.get("source_file")
     if not source:
         raise ValueError(f"{Path(bundle_dir) / 'manifest.json'} names no source_file")

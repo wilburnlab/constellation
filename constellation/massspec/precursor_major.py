@@ -62,7 +62,8 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from constellation.core import stages
-from constellation.massspec.bundle import peak_paths
+from constellation.massspec.bundle import MANIFEST_FILENAME as BUNDLE_MANIFEST
+from constellation.massspec.bundle import peak_paths, read_bundle_manifest, require_scans
 
 __all__ = [
     "LAYOUT_VERSION",
@@ -417,6 +418,8 @@ def build_precursor_major(bundle: Path | str, *, workers: int = 1, force: bool =
     import shutil
 
     bundle = Path(bundle)
+    if (bundle / BUNDLE_MANIFEST).is_file():  # convert and centroid build it before their manifest
+        require_scans(read_bundle_manifest(bundle), bundle, "the precursor-major layout")
     if not force and find_precursor_major(bundle) is not None:
         return bundle / PRECURSOR_MAJOR_DIR
     root = bundle / PRECURSOR_MAJOR_DIR

@@ -119,6 +119,7 @@ from constellation.massspec.bundle import (
     is_profile_bundle,
     iter_peak_batches,
     read_bundle_manifest,
+    require_scans,
 )
 from constellation.massspec.io.encyclopedia._codec import encode_f4, encode_f8
 from constellation.massspec.io.encyclopedia._schema import (
@@ -268,6 +269,7 @@ def _load_bundle(path: Path) -> _Bundle:
     manifest_path = path / "manifest.json"
     if manifest_path.is_file():
         manifest = read_bundle_manifest(path)
+        require_scans(manifest, path, "a spectra file")
         source_path = str(manifest.get("source_file") or source_path)
         if (manifest.get("parameters") or {}).get("partial"):
             raise ValueError(

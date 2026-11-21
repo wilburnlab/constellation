@@ -41,11 +41,14 @@ from constellation.massspec.bundle import (
     MANIFEST_FILENAME,
     PEAKS_DIR,
     PROFILE_DIR,
+    SCAN_INDEX,
+    SPECTRUM_INDEX_KEY,
     PeakWriter,
     is_profile_bundle,
     part_name,
     peak_rows,
     read_bundle_manifest,
+    spectrum_index,
 )
 from constellation.massspec.centroiding.apex import pick_apex
 from constellation.massspec.precursor_major import PRECURSOR_MAJOR_DIR, build_precursor_major
@@ -258,13 +261,16 @@ def centroid_bundle(
         )
     parameters = dict(parameters or {})
     name = peak_list_key(chosen_algorithm, parameters)
-    # A bundle derived from the run's profile (an average) names its list
-    # after itself, so its list does not land on the profile's.
-    run = (
-        source.name
-        if manifest.get("derived_from")
-        else Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
-    )
+    # A list made from spectra that are not the run's scans (an average) is
+    # named after them and numbers its spectra as they do, so it neither lands
+    # on the run's lists nor joins the run's family; it gets no precursor-major
+    # layout, which is the run's scans by isolation window.
+    index = spectrum_index(manifest)
+    if index != SCAN_INDEX:
+        run = source.name
+        precursor_major = False
+    else:
+        run = Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
     out = Path(output_dir) if output_dir is not None else source.parent / f"{run}.{name}"
     if out.exists() and any(out.iterdir()):
         if not force:
@@ -344,6 +350,7 @@ def centroid_bundle(
                 "version": chosen_algorithm.version,
                 "parameters": parameters,
             },
+            **({SPECTRUM_INDEX_KEY: index} if index != SCAN_INDEX else {}),
         }
         if precursor_major:
             build_precursor_major(out, workers=workers)

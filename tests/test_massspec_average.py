@@ -408,3 +408,89 @@ class TestCommand:
         (tmp_path / "empty").mkdir()
         args = self._parse(str(tmp_path / "empty"))
         assert args.func(args) == 2
+
+
+# ── what the bundle says it is ────────────────────────────────────────
+
+
+@pytest.fixture
+def family(tmp_path):
+    """A run as `convert` leaves it (its peak list and its profile, tied by
+    hash), a peak list made from the profile, the run's average and a peak
+    list made from the average."""
+    from constellation.massspec.centroiding import centroid_bundle
+
+    d = tmp_path / "data"
+    d.mkdir()
+    scans = _scans()
+    write_bundle_manifest(write_bundle(d, "run", [dict(s, mz=s["mz"][:5], intensity=s["intensity"][:5]) for s in scans]),
+                          run="run", sha256="S")
+    profile = write_bundle_manifest(write_bundle(d, "run.profile", scans, profile=True), run="run", sha256="S")
+    centroid_bundle(profile, "apex", precursor_major=False)
+    average = average_bundle(profile)
+    average_list = centroid_bundle(average, "apex")
+    return {"dir": d, "profile": profile, "average": average, "average_list": average_list}
+
+
+class TestWhatTheBundleSaysItIs:
+    def test_an_average_says_its_spectra_are_kinds_of_scan(self, family):
+        from constellation.massspec.bundle import KIND_OF_SCAN_INDEX, spectrum_index
+
+        assert spectrum_index(read_bundle_manifest(family["average"])) == KIND_OF_SCAN_INDEX
+        assert spectrum_index(read_bundle_manifest(family["average_list"])) == KIND_OF_SCAN_INDEX
+        assert spectrum_index(read_bundle_manifest(family["profile"])) == "scan"
+
+    def test_it_is_not_one_of_the_runs_bundles(self, family):
+        from constellation.massspec.bundle import related_bundles
+        from constellation.massspec.bundle_summary import summarize_bundle
+        from constellation.massspec.scans import open_acquisition
+
+        run = family["dir"] / "run"
+        assert sorted(r["bundle"].name for r in related_bundles(run)) == ["run.apex-7752bdef", "run.profile"]
+        names = [b["name"] for b in summarize_bundle(run)["bundles"]]
+        assert len(names) == len(set(names)) == 3
+        assert all(".average" not in r["bundle"].name for r in open_acquisition(family["profile"]).related)
+        # The average's own family is its peak list.
+        assert [r["bundle"].name for r in related_bundles(family["average"])] == [family["average_list"].name]
+
+    def test_its_peak_list_is_named_for_it_and_has_no_precursor_major_layout(self, family):
+        made = family["average_list"]
+        assert made.name.startswith("run.average.apex-")
+        assert not (made / "precursor_major").exists()
+        assert "precursor_major" not in read_bundle_manifest(made)["outputs"]
+
+    def test_what_needs_a_runs_scans_refuses_it(self, family, tmp_path):
+        from constellation.massspec.acquisitions import acquisition_record_from_bundle
+        from constellation.massspec.io.encyclopedia import write_dia
+        from constellation.massspec.precursor_major import build_precursor_major
+        from constellation.massspec.sweep.engine import sweep
+
+        for bundle in (family["average"], family["average_list"]):
+            with pytest.raises(ValueError, match="kind of scan.*an acquisition"):
+                acquisition_record_from_bundle(bundle)
+        with pytest.raises(ValueError, match="kind of scan.*a sweep"):
+            sweep(family["average_list"], None, None)
+        with pytest.raises(ValueError, match="kind of scan.*precursor-major"):
+            build_precursor_major(family["average_list"])
+        with pytest.raises(ValueError, match="kind of scan.*spectra file"):
+            write_dia([family["average_list"]], tmp_path / "x.dia")
+        # The run's own bundles are as they were.
+        assert acquisition_record_from_bundle(family["dir"] / "run")["source_sha256"] == "S"
+
+
+def test_its_scan_metadata_is_true_of_each_average(tmp_path):
+    scans = _scans()
+    for i, s in enumerate(scans):
+        s["agc_target"] = 30_000  # a method setting: every replicate shares it
+        s["agc_fill"] = 0.1 + 0.01 * i  # a reading: one scan's
+        s["precursor_scan"] = 1.0 if s["level"] == 2 else None  # a scan number of the run
+    scans.append(dict(scans[2], scan=len(scans) + 1, precursor_mz=900.0, isolation_lower=892.0, isolation_upper=908.0,
+                      filter_string="ITMS - p ESI r Full ms2 900.0000@hcd10.00 [200.0000-210.0000]"))  # a kind seen once
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "m.profile", scans, profile=True), run="m")
+    meta = pq.read_table(average_bundle(bundle) / "scan_metadata.parquet").to_pylist()
+    assert len(meta) == 9
+    assert all(m["agc_target"] == 30_000 for m in meta)
+    assert all(m["agc_fill"] is None for m in meta[:8]) and meta[8]["agc_fill"] is not None  # one replicate agrees with itself
+    assert all(m["precursor_scan"] is None and m["master_scan"] is None for m in meta)
+    assert all(m["trailer_extras"] is None and m["intensity_floor"] is None for m in meta)
+    assert [m["precursor_mz"] for m in meta[2:8]] == [w for _ in CONDITIONS for w in WINDOWS]
