@@ -75,11 +75,14 @@ from constellation.massspec.bundle import (
     PROFILE_BUNDLE_KIND,
     PROFILE_DIR,
     SPECTRUM_INDEX_KEY,
+    OutdatedBundleError,
     PeakWriter,
+    finish_derived_bundle,
     is_profile_bundle,
     iter_scan_blocks,
     part_name,
     peak_rows,
+    prepare_derived_bundle,
     read_bundle_manifest,
 )
 
@@ -426,16 +429,19 @@ def averaged_path(profile_bundle: Path | str, parent: Path | str | None = None) 
 def average_bundle(
     profile_bundle: Path | str,
     *,
-    output_dir: Path | str | None = None,
+    output_parent: Path | str | None = None,
     skip_first: int = 0,
     force: bool = False,
 ) -> Path:
     """Average ``profile_bundle`` into one spectrum per kind of scan; returns
-    the new bundle's path, ``<run>.average`` beside its source unless
-    ``output_dir`` says otherwise.
+    the new bundle, ``<run>.average`` in ``output_parent`` (default: beside
+    its source).
 
     ``skip_first`` leaves out the first that many scans of each kind (the
-    AGC's first fills); the default, 0, keeps every scan.
+    AGC's first fills); the default, 0, keeps every scan. An average already
+    there is made again only with ``force``, and replaced only once the new
+    one is whole; nothing else there is ever removed
+    (``bundle.prepare_derived_bundle``).
     """
     source = Path(profile_bundle)
     manifest = read_bundle_manifest(source)
@@ -446,14 +452,19 @@ def average_bundle(
         )
     if skip_first < 0:
         raise ValueError(f"skip_first must be 0 or more, got {skip_first}")
-    out = Path(output_dir) if output_dir is not None else averaged_path(source)
-    if out.resolve() == source.resolve():
-        raise ValueError("the averaged bundle cannot replace its source")
-    if out.exists() and any(out.iterdir()):
-        if not force:
-            raise FileExistsError(f"averaged bundle already there: {out} (pass --force to make it again)")
-        shutil.rmtree(out)
+    out = averaged_path(source, output_parent)
+    partial = prepare_derived_bundle(out, source, force=force)
+    try:
+        _average_into(partial, source, manifest, out, skip_first)
+        return finish_derived_bundle(partial, out)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
 
+
+def _average_into(partial: Path, source: Path, manifest: dict, out: Path, skip_first: int) -> None:
+    """Average ``source`` into the directory ``partial``, the manifest last,
+    as the bundle that will be put at ``out``."""
     scans = pq.read_table(source / SCAN_METADATA_FILENAME)
     _refuse(scans)
     kind, n_kinds = scan_kinds(scans)
@@ -509,88 +520,98 @@ def average_bundle(
     summary = _summary(scans, kind, kept, n_kinds, rep, origin, step, n_points, incomplete, off_per_kind)
 
     # ── write ─────────────────────────────────────────────────────────
-    (out / PROFILE_DIR).mkdir(parents=True, exist_ok=True)
-    (out / POINTS_DIR).mkdir(parents=True, exist_ok=True)
-    try:
-        with PeakWriter(out / PROFILE_DIR / part_name(0), byte_stream_split=True) as writer:
-            writer.write(peak_rows(rep, n_points, mz, mean))
-        pq.write_table(
-            pa.Table.from_arrays(
-                [pa.array((p_kind + 1).astype(np.int32)), pa.array(mz), pa.array(sd, mask=n_ < 2),
-                 pa.array(n_.astype(np.int32))],
-                schema=AVERAGE_POINTS_TABLE,
-            ),
-            out / POINTS_DIR / part_name(0),
-            compression="zstd",
-        )
-        pq.write_table(rep, out / SCAN_METADATA_FILENAME, compression="zstd")
-        pq.write_table(summary, out / SUMMARY_FILENAME, compression="zstd")
-        shutil.copy2(source / ACQUISITION_METADATA_FILENAME, out / ACQUISITION_METADATA_FILENAME)
-        parameters = {"skip_first": skip_first, "off_grid_tolerance": OFF_GRID_TOLERANCE}
-        levels: dict[int, dict[str, Any]] = {}
-        for lvl, n in zip(rep.column("level").to_pylist(), n_points.tolist()):
-            entry = levels.setdefault(int(lvl), {"level": int(lvl), "n_scans": 0, "n_peaks": 0, "peaks_from": {"profile": 0}})
-            entry["n_scans"] += 1
-            entry["n_peaks"] += int(n)
-            entry["peaks_from"]["profile"] += 1
-        record = {
-            "schema_version": BUNDLE_SCHEMA_VERSION,
-            "kind": PROFILE_BUNDLE_KIND,
-            # Its spectra are kinds of scan, not the run's scans: it is no
-            # member of the run's family, and sweeps and searches refuse it.
-            SPECTRUM_INDEX_KEY: KIND_OF_SCAN_INDEX,
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "source_file": manifest.get("source_file"),
-            "source_sha256": manifest.get("source_sha256"),
-            "parameters": {**parameters, "peak_bundle": None},
-            "outputs": {
-                "profile": PROFILE_DIR,
-                "average_points": POINTS_DIR,
-                "average_summary": SUMMARY_FILENAME,
-                "scan_metadata": SCAN_METADATA_FILENAME,
-                "acquisition_metadata": ACQUISITION_METADATA_FILENAME,
-            },
-            "run_metadata": {
-                **(manifest.get("run_metadata") or {}),
-                "n_scans": n_kinds,
-                "levels": [levels[k] for k in sorted(levels)],
-                "n_scans_averaged": int(n_scans.sum()),
-                "n_scans_skipped": int((~kept).sum()),
-                "n_points_read": n_read,
-                "n_points_off_grid": int(off_per_kind.sum()),
-            },
-            "derived_from": {
-                "name": SUFFIX,
-                "source": os.path.relpath(source, out.parent),
-                "algorithm": "mean",
-                "version": VERSION,
-                "parameters": parameters,
-            },
-        }
-        (out / MANIFEST_FILENAME).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    except BaseException:
-        shutil.rmtree(out, ignore_errors=True)
-        raise
-    return out
+    (partial / PROFILE_DIR).mkdir()
+    (partial / POINTS_DIR).mkdir()
+    with PeakWriter(partial / PROFILE_DIR / part_name(0), byte_stream_split=True) as writer:
+        writer.write(peak_rows(rep, n_points, mz, mean))
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array((p_kind + 1).astype(np.int32)), pa.array(mz), pa.array(sd, mask=n_ < 2),
+             pa.array(n_.astype(np.int32))],
+            schema=AVERAGE_POINTS_TABLE,
+        ),
+        partial / POINTS_DIR / part_name(0),
+        compression="zstd",
+    )
+    pq.write_table(rep, partial / SCAN_METADATA_FILENAME, compression="zstd")
+    pq.write_table(summary, partial / SUMMARY_FILENAME, compression="zstd")
+    shutil.copy2(source / ACQUISITION_METADATA_FILENAME, partial / ACQUISITION_METADATA_FILENAME)
+    parameters = {"skip_first": skip_first, "off_grid_tolerance": OFF_GRID_TOLERANCE}
+    levels: dict[int, dict[str, Any]] = {}
+    for lvl, n in zip(rep.column("level").to_pylist(), n_points.tolist()):
+        entry = levels.setdefault(int(lvl), {"level": int(lvl), "n_scans": 0, "n_peaks": 0, "peaks_from": {"profile": 0}})
+        entry["n_scans"] += 1
+        entry["n_peaks"] += int(n)
+        entry["peaks_from"]["profile"] += 1
+    record = {
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "kind": PROFILE_BUNDLE_KIND,
+        # Its spectra are kinds of scan, not the run's scans: it is no
+        # member of the run's family, and sweeps and searches refuse it.
+        SPECTRUM_INDEX_KEY: KIND_OF_SCAN_INDEX,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_file": manifest.get("source_file"),
+        "source_sha256": manifest.get("source_sha256"),
+        "parameters": {**parameters, "peak_bundle": None},
+        "outputs": {
+            "profile": PROFILE_DIR,
+            "average_points": POINTS_DIR,
+            "average_summary": SUMMARY_FILENAME,
+            "scan_metadata": SCAN_METADATA_FILENAME,
+            "acquisition_metadata": ACQUISITION_METADATA_FILENAME,
+        },
+        "run_metadata": {
+            **(manifest.get("run_metadata") or {}),
+            "n_scans": n_kinds,
+            "levels": [levels[k] for k in sorted(levels)],
+            "n_scans_averaged": int(n_scans.sum()),
+            "n_scans_skipped": int((~kept).sum()),
+            "n_points_read": n_read,
+            "n_points_off_grid": int(off_per_kind.sum()),
+        },
+        "derived_from": {
+            "name": SUFFIX,
+            "source": os.path.relpath(source, out.parent),
+            "algorithm": "mean",
+            "version": VERSION,
+            "parameters": parameters,
+        },
+    }
+    (partial / MANIFEST_FILENAME).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
 # ── a directory of runs ───────────────────────────────────────────────
+
+
+def _survey(directory: Path | str) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """The run profile bundles directly inside ``directory`` (not recursive),
+    sorted by name, and the bundles there that cannot be read, with why.
+    Peak bundles, bundles made from another (an earlier ``.average``) and
+    directories that are not bundles are left out."""
+    runs: list[Path] = []
+    problems: list[tuple[Path, str]] = []
+    for child in sorted(Path(directory).iterdir(), key=lambda p: p.name):
+        if child.name.startswith(".") or not (child / MANIFEST_FILENAME).is_file():
+            continue
+        try:
+            manifest = read_bundle_manifest(child)
+        except OutdatedBundleError as exc:
+            problems.append((child, str(exc)))
+            continue
+        except ValueError as exc:  # another kind of directory; or a manifest that does not parse
+            if is_profile_bundle(child):
+                problems.append((child, f"its manifest cannot be read: {exc}"))
+            continue
+        if is_profile_bundle(child) and not manifest.get("derived_from"):
+            runs.append(child)
+    return runs, problems
 
 
 def find_profile_bundles(directory: Path | str) -> list[Path]:
     """The run profile bundles directly inside ``directory`` (not recursive),
     sorted by name. Peak bundles and bundles made from another bundle (an
     earlier ``.average``) are not runs to average and are left out."""
-    found = []
-    for child in sorted(Path(directory).iterdir(), key=lambda p: p.name):
-        if not (child / MANIFEST_FILENAME).is_file():
-            continue
-        try:
-            if is_profile_bundle(child) and not read_bundle_manifest(child).get("derived_from"):
-                found.append(child)
-        except Exception:  # an unreadable manifest is not a run we can average
-            continue
-    return found
+    return _survey(directory)[0]
 
 
 @dataclass(frozen=True)
@@ -613,23 +634,25 @@ def average_directory(
 ) -> list[AverageResult]:
     """Average every run profile bundle directly inside ``directory`` (see
     :func:`find_profile_bundles`), each to ``<run>.average`` in
-    ``output_parent`` (default: beside its source). A run that is already
-    averaged is skipped unless ``force``; a run that fails is reported and the
-    rest carry on."""
+    ``output_parent`` (default: beside its source). A run whose average is
+    there and finished is skipped unless ``force``; a run that fails, or a
+    bundle that cannot be read (an older format), is reported and the rest
+    carry on."""
     if skip_first < 0:
         raise ValueError(f"skip_first must be 0 or more, got {skip_first}")
-    results = []
-    for bundle in find_profile_bundles(directory):
+    runs, problems = _survey(directory)
+    results = [AverageResult(bundle, "error", None, detail) for bundle, detail in problems]
+    for bundle in runs:
         try:
             out = averaged_path(bundle, output_parent)
-            if out.exists() and any(out.iterdir()) and not force:
+            if (out / MANIFEST_FILENAME).is_file() and not force:
                 results.append(AverageResult(bundle, "skipped", out, "already averaged"))
                 continue
-            made = average_bundle(bundle, output_dir=out, skip_first=skip_first, force=force)
+            made = average_bundle(bundle, output_parent=output_parent, skip_first=skip_first, force=force)
             results.append(AverageResult(bundle, "ok", made))
         except Exception as exc:  # one bad run must not stop the rest
             results.append(AverageResult(bundle, "error", None, f"{type(exc).__name__}: {exc}"))
-    return results
+    return sorted(results, key=lambda r: r.bundle.name)
 
 
 __all__ = [

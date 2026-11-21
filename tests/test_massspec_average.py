@@ -131,7 +131,7 @@ class TestAverageBundle:
             assert s["grid_step_mz"] == pytest.approx(STEP1 if m["level"] == 1 else STEP2, abs=2e-6)
 
     def test_by_default_every_scan_is_kept(self, profile, tmp_path):
-        out = average_bundle(profile, output_dir=tmp_path / "all")
+        out = average_bundle(profile, output_parent=tmp_path / "all")
         assert read_bundle_manifest(out)["derived_from"]["parameters"]["skip_first"] == 0
         points, extra, _, summary = _out(out)
         assert all(s["n_scans"] == 5 and s["n_skipped"] == 0 for s in summary)
@@ -199,12 +199,12 @@ class TestAverageBundle:
 
         monkeypatch.setattr(driver.shutil, "copy2", broken)
         with pytest.raises(RuntimeError):
-            average_bundle(profile, output_dir=tmp_path / "out")
-        assert not (tmp_path / "out").exists()
+            average_bundle(profile, output_parent=tmp_path / "out")
+        assert list((tmp_path / "out").iterdir()) == []  # neither the average nor its partial directory
 
     def test_the_same_run_averages_to_the_same_bytes(self, profile, tmp_path):
-        a = average_bundle(profile, output_dir=tmp_path / "a", skip_first=1)
-        b = average_bundle(profile, output_dir=tmp_path / "b", skip_first=1)
+        a = average_bundle(profile, output_parent=tmp_path / "a", skip_first=1)
+        b = average_bundle(profile, output_parent=tmp_path / "b", skip_first=1)
         files = sorted(p.relative_to(a) for p in a.rglob("*.parquet"))
         assert files and files == sorted(p.relative_to(b) for p in b.rglob("*.parquet"))
         for f in files:
@@ -385,7 +385,7 @@ class TestCommand:
         assert self._parse(str(profile)).skip_first == 0
         args = self._parse(str(profile), "--skip-first", "1", "-o", str(tmp_path / "elsewhere"))
         assert args.func(args) == 0
-        summary = pq.read_table(tmp_path / "elsewhere" / SUMMARY_FILENAME).to_pylist()
+        summary = pq.read_table(tmp_path / "elsewhere" / "run.average" / SUMMARY_FILENAME).to_pylist()
         assert all(s["n_scans"] == 4 and s["n_skipped"] == 1 for s in summary)
 
     def test_a_directory_averages_every_run_and_reports_failures(self, run_dir, capsys):
@@ -494,3 +494,106 @@ def test_its_scan_metadata_is_true_of_each_average(tmp_path):
     assert all(m["precursor_scan"] is None and m["master_scan"] is None for m in meta)
     assert all(m["trailer_extras"] is None and m["intensity_floor"] is None for m in meta)
     assert [m["precursor_mz"] for m in meta[2:8]] == [w for _ in CONDITIONS for w in WINDOWS]
+
+
+# ── where it is written, and what is never removed ────────────────────
+
+
+class TestOutputSafety:
+    def test_o_names_where_the_average_goes_in_both_modes(self, profile, run_dir, tmp_path):
+        assert average_bundle(profile, output_parent=tmp_path / "x") == tmp_path / "x" / "run.average"
+        results = average_directory(run_dir, output_parent=tmp_path / "y")
+        assert {r.output for r in results if r.status == "ok"} == {tmp_path / "y" / "a_run.average", tmp_path / "y" / "b_run.average"}
+
+    def test_force_never_removes_what_is_not_an_average_of_this_run(self, profile, tmp_path):
+        from constellation.massspec.bundle import prepare_derived_bundle
+
+        # The profile's own parent (what `-o <parent> --force` removed before).
+        with pytest.raises(ValueError, match="holds"):
+            prepare_derived_bundle(tmp_path, profile, force=True)
+        # Someone's directory where the average would go.
+        theirs = tmp_path / "out" / "run.average"
+        theirs.mkdir(parents=True)
+        (theirs / "figure.svg").write_text("keep")
+        with pytest.raises(FileExistsError, match="not a bundle made from"):
+            average_bundle(profile, output_parent=tmp_path / "out", force=True)
+        assert (theirs / "figure.svg").read_text() == "keep" and (profile / "manifest.json").is_file()
+
+    def test_a_failed_forced_rerun_keeps_the_average_there(self, profile, tmp_path):
+        out = average_bundle(profile)
+        before = (out / "manifest.json").read_text()
+        with pytest.raises(ValueError, match="nothing to average"):
+            average_bundle(profile, skip_first=99, force=True)
+        assert (out / "manifest.json").read_text() == before
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+    def test_a_forced_rerun_replaces_it_whole(self, profile):
+        out = average_bundle(profile)
+        (out / "stale").write_text("x")
+        assert average_bundle(profile, skip_first=1, force=True) == out
+        assert not (out / "stale").exists()
+        assert read_bundle_manifest(out)["derived_from"]["parameters"]["skip_first"] == 1
+
+    def test_what_a_killed_run_leaves_is_cleared_and_the_run_averaged(self, run_dir):
+        partial = run_dir / ".a_run.average.partial"
+        (partial / "profile").mkdir(parents=True)  # a run killed while writing
+        results = {r.bundle.name: r for r in average_directory(run_dir)}
+        assert results["a_run.profile"].status == "ok"
+        assert not partial.exists() and (run_dir / "a_run.average" / "manifest.json").is_file()
+
+    def test_an_unfinished_directory_where_the_average_goes_is_reported_not_skipped(self, run_dir):
+        old = run_dir / "a_run.average"
+        (old / "profile").mkdir(parents=True)  # no manifest: not a finished average
+        results = {r.bundle.name: r for r in average_directory(run_dir)}
+        assert results["a_run.profile"].status == "error" and "not a bundle made from" in results["a_run.profile"].detail
+        assert (old / "profile").is_dir()  # left as it was
+        assert results["b_run.profile"].status == "ok"
+
+    def test_a_bundle_in_an_older_format_is_reported(self, run_dir):
+        old = run_dir / "old.profile"
+        write_bundle_manifest(write_bundle(run_dir, "old.profile", _scans()[:4], profile=True), run="old")
+        manifest = json.loads((old / "manifest.json").read_text())
+        manifest["schema_version"] = 2
+        (old / "manifest.json").write_text(json.dumps(manifest))
+        results = {r.bundle.name: r for r in average_directory(run_dir)}
+        assert results["old.profile"].status == "error" and "older" in results["old.profile"].detail
+
+
+class TestCommandReports:
+    def _run(self, *argv):
+        from constellation.massspec.cli import build_parser
+
+        root = argparse.ArgumentParser()
+        build_parser(root.add_subparsers(dest="command"))
+        args = root.parse_args(["massspec", "average", *argv])
+        return args.func(args)
+
+    def test_it_says_what_it_made(self, profile, capsys):
+        assert self._run(str(profile), "--skip-first", "1") == 0
+        out, err = capsys.readouterr()
+        assert "8 kind(s) of scan from 32 scans (8 skipped)" in out and "warning" not in err
+
+    def test_points_off_the_grid_are_a_warning(self, tmp_path, capsys):
+        scans = _scans()
+        scans[-1]["mz"] = scans[-1]["mz"].copy()
+        scans[-1]["mz"][10] += STEP2 / 2
+        bundle = write_bundle_manifest(write_bundle(tmp_path, "r.profile", scans, profile=True), run="r")
+        assert self._run(str(bundle)) == 0
+        assert "warning: r.average: 1 points sat on no grid point" in capsys.readouterr().err
+
+    def test_something_else_where_it_goes_is_exit_4_and_kept(self, profile, tmp_path, capsys):
+        theirs = tmp_path / "o" / "run.average"
+        theirs.mkdir(parents=True)
+        (theirs / "keep").write_text("x")
+        assert self._run(str(profile), "-o", str(tmp_path / "o"), "--force") == 4
+        assert (theirs / "keep").is_file()
+
+    def test_a_directory_of_only_old_bundles_is_reported_not_called_empty(self, tmp_path, capsys):
+        d = tmp_path / "d"
+        d.mkdir()
+        b = write_bundle_manifest(write_bundle(d, "old.profile", _scans()[:4], profile=True), run="old")
+        manifest = json.loads((b / "manifest.json").read_text())
+        manifest["schema_version"] = 2
+        (b / "manifest.json").write_text(json.dumps(manifest))
+        assert self._run(str(d)) == 5
+        assert "0 averaged, 0 skipped, 1 failed" in capsys.readouterr().err

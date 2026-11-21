@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+import shutil
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -233,6 +235,71 @@ def related_bundles(bundle_dir: Path | str) -> list[dict[str, Any]]:
         }
         for c in sorted(tied)
     ]
+
+
+# ── writing a bundle made from another ────────────────────────────────
+
+
+def _made_from(directory: Path, source: Path) -> bool:
+    """Whether ``directory`` is a bundle whose manifest says it was made from
+    ``source`` (in any format: an older one is still ours to replace)."""
+    try:
+        manifest = json.loads((directory / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    named = (manifest.get("derived_from") or {}).get("source")
+    return (
+        manifest.get("kind") in BUNDLE_KINDS
+        and bool(named)
+        and (directory.parent / str(named)).resolve() == source.resolve()
+    )
+
+
+def prepare_derived_bundle(out: Path | str, source: Path | str, *, force: bool) -> Path:
+    """A new, hidden directory beside ``out`` to write a bundle made from
+    ``source`` into; :func:`finish_derived_bundle` then puts it at ``out``.
+
+    Nothing at ``out`` is touched here, and only what is safe is ever
+    replaced: never ``source`` or a directory holding it; with ``force``, a
+    finished bundle made from ``source`` (its manifest's ``derived_from``
+    names it); an empty directory. Anything else is refused, ``force`` or
+    not, as not this command's to remove. A leftover from a run that was
+    killed is cleared.
+    """
+    out, source = Path(out), Path(source)
+    if out.resolve() == source.resolve() or source.resolve().is_relative_to(out.resolve()):
+        raise ValueError(f"{out} holds {source}: what is made from it cannot be written there")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        if not _made_from(out, source):
+            raise FileExistsError(
+                f"{out} is there and is not a bundle made from {source.name}; it is not removed, even "
+                f"with --force: choose another output directory, or remove it yourself"
+            )
+        if not force:
+            raise FileExistsError(f"already there: {out} (pass --force to make it again)")
+    partial = out.with_name(f".{out.name}.partial")
+    if partial.exists():
+        shutil.rmtree(partial)
+    partial.mkdir(parents=True)
+    return partial
+
+
+def finish_derived_bundle(partial: Path | str, out: Path | str) -> Path:
+    """Put the bundle written in ``partial`` (:func:`prepare_derived_bundle`)
+    at ``out``, replacing what is there only now that the new one is whole."""
+    partial, out = Path(partial), Path(out)
+    if out.exists():
+        replaced = out.with_name(f".{out.name}.replaced")
+        if replaced.exists():
+            shutil.rmtree(replaced)
+        os.replace(out, replaced)
+        os.replace(partial, out)
+        shutil.rmtree(replaced, ignore_errors=True)
+    else:
+        os.replace(partial, out)
+    return out
 
 
 def part_name(index: int) -> str:
@@ -675,6 +742,7 @@ __all__ = [
     "PeakWriter",
     "SCAN_INDEX",
     "SPECTRUM_INDEX_KEY",
+    "finish_derived_bundle",
     "has_peaks",
     "is_profile_bundle",
     "iter_peak_batches",
@@ -687,6 +755,7 @@ __all__ = [
     "peaks_dataset",
     "point_paths",
     "points_dataset",
+    "prepare_derived_bundle",
     "read_bundle_manifest",
     "related_bundles",
     "require_scans",
