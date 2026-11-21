@@ -772,6 +772,11 @@ def finish_own_algorithm(job: _Job, centroid_algo: str, keep_profile: bool, work
 
     if job.read.centroider is not None:
         return job.manifest
+    if job.force and job.out_dir.is_dir():
+        # What an earlier conversion wrote there, as any forced conversion
+        # clears it; anything else is not convert's, and centroid_bundle
+        # refuses to remove it.
+        _clear_outputs(job.out_dir)
     try:
         centroid_bundle(
             job.profile_dir, centroid_algo, output_dir=job.out_dir, workers=workers, force=job.force,

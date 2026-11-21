@@ -6,6 +6,8 @@ each holding the verb's parser and its handler:
 
     convert            Thermo .raw -> a peak bundle and a profile bundle
     centroid           a peak list from a profile bundle
+    average            one spectrum per kind of scan from a direct-infusion
+                       profile bundle
     mz_axis            how far a bundle's m/z axis reads high or low
     precursor_major    a bundle's peaks ordered by isolation window, for a search
     search             EncyclopeDIA search of one acquisition, written as
@@ -43,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 
+from constellation.massspec.cli.average import _build_average_parser
 from constellation.massspec.cli.centroid import _build_centroid_parser
 from constellation.massspec.cli.chromatogram import _build_chromatogram_parser
 from constellation.massspec.cli.collision_filter import _build_collision_filter_parser
@@ -95,6 +98,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
 
     _build_convert_parser(ms_subs)
     _build_centroid_parser(ms_subs)
+    _build_average_parser(ms_subs)
     _build_search_parser(ms_subs)
     _build_summarize_parser(ms_subs)
     _build_report_parser(ms_subs)

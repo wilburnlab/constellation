@@ -51,12 +51,14 @@ from constellation.massspec.acquisition_structure import (
 )
 from constellation.massspec.bundle import (
     BUNDLE_KINDS,
+    SCAN_INDEX,
     is_profile_bundle,
     list_mz_axes,
     peak_list_name,
     points_dataset,
     read_bundle_manifest,
     related_bundles,
+    spectrum_index,
 )
 from constellation.massspec.quant.peak_index import (
     find_peak_index,
@@ -126,6 +128,10 @@ class AcquisitionInfo:
     #: them only for the whole run, so every level gets that list.
     analyzers: dict[int, tuple[str, ...]]
     rt_range: tuple[float, float]
+    #: What its spectrum numbers count (``bundle.spectrum_index``): ``scan``
+    #: for a run's scans in time, ``kind_of_scan`` for an average. Bundles of
+    #: one run count alike only within one index.
+    spectrum_index: str = SCAN_INDEX
 
 
 def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
@@ -155,6 +161,8 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
         analyzers[level] = seen or run_analyzers
 
     try:
+        if spectrum_index(manifest) != SCAN_INDEX:  # an average: one spectrum per kind, no acquisition scheme
+            raise ValueError("not a run's scans")
         structure = infer_acquisition_structure(meta)
         acquisition_type, staggered = structure.acquisition_type, structure.is_staggered
     except ValueError:  # no MS2 scans, or none with isolation bounds
@@ -180,6 +188,7 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
         scans_per_level=counts,
         analyzers=analyzers,
         rt_range=rt_range,
+        spectrum_index=spectrum_index(manifest),
     )
 
 

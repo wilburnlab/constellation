@@ -37,7 +37,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
-from constellation.massspec.bundle import PEAK_BUNDLE_KINDS, read_bundle_manifest
+from constellation.massspec.bundle import PEAK_BUNDLE_KINDS, SCAN_INDEX, read_bundle_manifest, spectrum_index
 from constellation.massspec.manifest import ALL_ACQUISITIONS, open_table
 
 IDENTIFICATION_SCHEMA = pa.schema(
@@ -405,12 +405,14 @@ def identifications(
 
 def _bundle_manifest(path: Path) -> dict[str, Any] | None:
     """A peak bundle's manifest; None for anything else, so a bundle in an
-    older format reads as not found and is reported as such, not opened."""
+    older format reads as not found and is reported as such, not opened, and
+    a list made from an average of the run (its spectra kinds of scan, under
+    the run's hash and name) is never taken for the run's scans."""
     try:
         data = read_bundle_manifest(path)
     except (FileNotFoundError, NotADirectoryError, ValueError):
         return None
-    if data.get("kind") not in PEAK_BUNDLE_KINDS:
+    if data.get("kind") not in PEAK_BUNDLE_KINDS or spectrum_index(data) != SCAN_INDEX:
         return None
     return data
 

@@ -41,11 +41,15 @@ from constellation.massspec.bundle import (
     MANIFEST_FILENAME,
     PEAKS_DIR,
     PROFILE_DIR,
+    SCAN_INDEX,
+    SPECTRUM_INDEX_KEY,
     PeakWriter,
+    derived_bundle_writer,
     is_profile_bundle,
     part_name,
     peak_rows,
     read_bundle_manifest,
+    spectrum_index,
 )
 from constellation.massspec.centroiding.apex import pick_apex
 from constellation.massspec.precursor_major import PRECURSOR_MAJOR_DIR, build_precursor_major
@@ -258,26 +262,35 @@ def centroid_bundle(
         )
     parameters = dict(parameters or {})
     name = peak_list_key(chosen_algorithm, parameters)
-    run = Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
-    out = Path(output_dir) if output_dir is not None else source.parent / f"{run}.{name}"
-    if out.exists() and any(out.iterdir()):
-        if not force:
-            raise FileExistsError(f"peak list already there: {out} (pass --force to make it again)")
-        shutil.rmtree(out)
+    # A list made from spectra that are not the run's scans (an average) is
+    # named after them and numbers its spectra as they do, so it neither lands
+    # on the run's lists nor joins the run's family; it gets no precursor-major
+    # layout, which is the run's scans by isolation window.
+    index = spectrum_index(manifest)
+    if index != SCAN_INDEX:
+        run = source.name
+        precursor_major = False
+    else:
+        run = Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
+    final = Path(output_dir) if output_dir is not None else source.parent / f"{run}.{name}"
     scan_table = pq.read_table(source / SCAN_METADATA_FILENAME)
     _refuse_other_analyzers(scan_table, chosen_algorithm)
     chosen = _chosen_scans(scan_table, scans, stride)
     partial = chosen is not None
 
-    (out / PEAKS_DIR).mkdir(parents=True, exist_ok=True)
-    parts = sorted((source / PROFILE_DIR).glob("part-*.parquet"))
-    # What a worker reads per scan: the verbatim trailer is most of the table.
-    narrow = scan_table.select([c for c in scan_table.column_names if c != "trailer_extras"])
-    tasks = [
-        (str(p), str(out / PEAKS_DIR / part_name(i)), algorithm, parameters, narrow, chosen, rt_bin_width_s)
-        for i, p in enumerate(parts)
-    ]
-    try:
+    # Written beside where it goes and put there whole: a list already there
+    # is replaced only with force and only once the new one is finished, and
+    # nothing else there is ever removed (until 2026-11-20 `-o DIR --force`
+    # removed whatever DIR was).
+    with derived_bundle_writer(final, source, force=force) as out:
+        (out / PEAKS_DIR).mkdir()
+        parts = sorted((source / PROFILE_DIR).glob("part-*.parquet"))
+        # What a worker reads per scan: the verbatim trailer is most of the table.
+        narrow = scan_table.select([c for c in scan_table.column_names if c != "trailer_extras"])
+        tasks = [
+            (str(p), str(out / PEAKS_DIR / part_name(i)), algorithm, parameters, narrow, chosen, rt_bin_width_s)
+            for i, p in enumerate(parts)
+        ]
         if workers <= 1 or len(tasks) <= 1:
             results = [_make_part_star(t) for t in tasks]
         else:
@@ -338,11 +351,9 @@ def centroid_bundle(
                 "version": chosen_algorithm.version,
                 "parameters": parameters,
             },
+            **({SPECTRUM_INDEX_KEY: index} if index != SCAN_INDEX else {}),
         }
         if precursor_major:
             build_precursor_major(out, workers=workers)
         (out / MANIFEST_FILENAME).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    except BaseException:
-        shutil.rmtree(out, ignore_errors=True)
-        raise
-    return out
+    return final
