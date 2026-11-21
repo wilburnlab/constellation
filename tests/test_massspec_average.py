@@ -22,13 +22,12 @@ from _massspec_fixtures import write_bundle, write_bundle_manifest
 
 from constellation.massspec.acquisition_structure import scan_kinds
 from constellation.massspec.schemas import SCAN_METADATA_TABLE
-from constellation.massspec.averaging import (
+from constellation.massspec.average import (
     POINTS_DIR,
     SUMMARY_FILENAME,
     average_bundle,
     average_directory,
     find_profile_bundles,
-    group_scans,
 )
 from constellation.massspec.bundle import read_bundle_manifest
 from constellation.massspec.scans import spectrum
@@ -193,7 +192,7 @@ class TestAverageBundle:
             average_bundle(profile, skip_first=5)
 
     def test_a_failure_leaves_nothing(self, profile, tmp_path, monkeypatch):
-        from constellation.massspec.averaging import driver
+        from constellation.massspec import average as driver
 
         def broken(*_, **__):
             raise RuntimeError("no")
@@ -202,6 +201,39 @@ class TestAverageBundle:
         with pytest.raises(RuntimeError):
             average_bundle(profile, output_dir=tmp_path / "out")
         assert not (tmp_path / "out").exists()
+
+    def test_the_same_run_averages_to_the_same_bytes(self, profile, tmp_path):
+        a = average_bundle(profile, output_dir=tmp_path / "a", skip_first=1)
+        b = average_bundle(profile, output_dir=tmp_path / "b", skip_first=1)
+        files = sorted(p.relative_to(a) for p in a.rglob("*.parquet"))
+        assert files and files == sorted(p.relative_to(b) for p in b.rglob("*.parquet"))
+        for f in files:
+            assert (a / f).read_bytes() == (b / f).read_bytes(), f
+
+    def test_a_stellar_grid_is_followed_over_its_whole_span(self, tmp_path):
+        # As the instrument stores it: a float32 step accumulated in double,
+        # 19,500 points over 200-1500 m/z, zeros included (RF30's MS2 scans).
+        step = float(np.float32(1 / 15))
+        grid = 200.0 + np.arange(1, 19_501) * step
+        rng = np.random.default_rng(1)
+        scans = [
+            {"scan": i + 1, "level": 2, "rt": i * 0.1, "iit": 20.0, "tic": 1.0, "analyzer": "ITMS",
+             "filter_string": "ITMS + p NSI r Full ms2 500.0000@hcd24.00 [200.0000-1500.0000]",
+             "activation_type": "HCD", "collision_energy": 24.0, "precursor_mz": 500.0,
+             "isolation_lower": 496.0, "isolation_upper": 504.0,
+             "scan_window_lower": 200.0, "scan_window_upper": 1500.0,
+             "mz": grid, "intensity": np.where(rng.random(grid.size) < 0.5, 0.0, rng.gamma(1.0, 50.0, grid.size))}
+            for i in range(4)
+        ]
+        bundle = write_bundle_manifest(write_bundle(tmp_path, "s.profile", scans, profile=True, row_group_size=7_000), run="s")
+        out = average_bundle(bundle)
+        points, extra, _, summary = _out(out)
+        assert summary[0]["n_points_off_grid"] == 0 and summary[0]["n_points"] == grid.size
+        assert summary[0]["grid_step_mz"] == pytest.approx(step, rel=1e-12)
+        assert np.max(np.abs(points["mz"] - grid)) < 1e-9
+        planted = np.mean([s["intensity"] for s in scans], axis=0)
+        assert points["intensity"] == pytest.approx(planted, rel=1e-12, abs=1e-12)
+        assert set(extra["n_scans"].tolist()) == {4}
 
 
 @pytest.fixture
@@ -262,7 +294,7 @@ class TestAverageDirectory:
 
 def test_scans_are_grouped_by_what_was_acquired(profile) -> None:
     table = pq.read_table(profile / "scan_metadata.parquet")
-    group, n = group_scans(table)
+    group, n = scan_kinds(table)
     assert n == 8
     assert np.bincount(group).tolist() == [5] * 8
     assert group[:8].tolist() == list(range(8))  # first cycle sets the order

@@ -61,7 +61,7 @@ def _cmd_massspec_average(args: argparse.Namespace) -> int:
     """Exits: 0 done (every run ok or skipped); 2 bad input, or a directory with
     no profile bundles; 4 one bundle's average already there; 5 a directory
     run failed (the rest are still made)."""
-    from constellation.massspec.averaging import average_bundle
+    from constellation.massspec.average import average_bundle
 
     if args.bundle.is_dir() and not (args.bundle / "manifest.json").is_file():
         return _cmd_massspec_average_directory(args)
@@ -78,7 +78,7 @@ def _cmd_massspec_average(args: argparse.Namespace) -> int:
 
 
 def _cmd_massspec_average_directory(args: argparse.Namespace) -> int:
-    from constellation.massspec.averaging import average_directory, find_profile_bundles
+    from constellation.massspec.average import average_directory, find_profile_bundles
 
     if not find_profile_bundles(args.bundle):
         print(
