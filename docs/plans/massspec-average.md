@@ -43,9 +43,26 @@ Synthetic bundles of Stellar-sized MS2 scans (19,500 points), 58.5M points, this
 |---|---|---|
 | PR as submitted (dense `np.bincount` per block) | 3.9 s | 8.2 s |
 | Refined (`np.add.at` in place) | 3.7–4.2 s | 5.4 s |
-| Arrow (Acero) hash group-by, single-threaded | 11.9 s | 231 s |
+| Arrow (Acero) group-by with `hash_stddev`, one thread | 11.9 s | 231 s |
+| Arrow group-by, variance from sums (count, Σx, Σx²), one thread, reduction alone | 3.8 s | 6.9 s |
 
-- **The reduction.** The refined version gives the PR's means, SDs and m/z to the last bits, and the same bytes on a rerun. The group-by gave the same numbers, but is the slower choice: the grid index is already a perfect hash, and determinism needs one thread.
+The first three rows are the whole average (the pass that finds each kind's extent, the reduction and the writing); the last is the reduction alone, with the grid given.
+
+- **The reduction.** The refined version gives the PR's means, SDs and m/z to the last bits, and the same bytes on a rerun.
+- **Why the first Arrow plan was slow** (corrected 2026-11-21; this said "the grid index is already a perfect hash", which the decomposition below does not support). The cause is Arrow's grouped standard deviation (`hash_stddev`, pyarrow 22.0.0), not the grouping. On the 300-kind bundle, one thread, adding one stage at a time:
+
+  | Stage | Time |
+  |---|---|
+  | read the points | 2.5 s |
+  | + join each point to its scan's kind and grid | 1.9 s |
+  | + group by (kind, grid index, off-grid flag), count | 6.6 s |
+  | group by one precomputed key, count and mean | 5.6 s |
+  | + `hash_stddev` | 273.6 s (25.9 s with threads) |
+
+  With 10 kinds `hash_stddev` adds 3.6 s; with 300 kinds and the same points, 268 s.
+  - Its cost follows the number of groups, not the rows. Each batch of about 32,000 points touches about as many of the 5.85M groups, so the kernel evidently does work for every group on every batch: the pattern of the first version's grid-sized `np.bincount` per block, in smaller batches. A larger scan batch size did not change it.
+  - This mechanism is inferred from the measurements, not read from Arrow's source.
+- **Why numpy is kept.** With the variance taken from sums, an Arrow group-by is as fast as numpy. numpy is kept because it places each point by its address, with no join or hashing, in about the same time, deterministically on one thread.
 - **RF30, as a stress test.** The profile bundle of a 100-min Stellar DIA run (4.59 billion points, read from `/mnt/e`) averaged in 493 s at 1.55 GB peak RSS:
   - 101 kinds (1 MS1, 100 windows);
   - 1,962,000 points;
