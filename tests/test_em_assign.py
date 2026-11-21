@@ -591,3 +591,20 @@ def test_round2_falls_back_to_the_best_score_outside_the_likelihood_window():
     assert row["runner_up_template_id"] == 101
     assert row["runner_up_identity"] == pytest.approx(0.975)
     assert row["runner_up_logl_gap"] is None
+
+
+def test_a_read_of_another_extent_is_refused_under_the_end_tolerance() -> None:
+    """The single-pass reducer applies the extent rule to minimap2's
+    coordinates: a read covering only the last 150 nt of a 200-nt template
+    is `extent`, not assigned; without the rule it is assigned."""
+    seq = "ACGT" * 50
+    row = _row(0, 0, n_match=150, aln_len=150, as_score=300, cigar="150=",
+               q_len=150, q_start=0, q_end=150, t_start=50, t_end=200)
+    for tol, want in ((30, -1), (None, 0)):
+        hb = scan_paf_block(_paf([row]), n_templates=1)
+        batch = assign_block(hb, store=_store([seq]), reads=_Reads(["r0"]),
+                             round_index=2, end_tolerance=tol)
+        got = batch.to_pylist()[0]
+        assert got["template_row"] == want
+        if tol is not None:
+            assert got["unassigned_reason"] == "extent"

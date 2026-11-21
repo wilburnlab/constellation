@@ -877,3 +877,27 @@ def test_half_the_shorter_sequence_is_the_line(panel, tmp_path):
     assert stats["n_assigned"] == 0 and stats["n_short_placement"] == 36
     stats, _ = _run(panel, tmp_path / "enough", align_fn=placing(310))
     assert stats["n_assigned"] == 36 and stats["n_short_placement"] == 0
+
+
+def test_join_rows_sort_as_the_four_key_lexsort() -> None:
+    """`_sort_rows` orders rows exactly as `lexsort((strat, diag, t_row,
+    local))` up to ties on all four keys, which carry identical rows; a
+    product of ranges past int64 takes the lexsort itself."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.native import _sort_rows
+
+    rng = np.random.default_rng(11)
+    for n, t_max, d_span in ((0, 5, 5), (1, 5, 5), (5000, 40, 30), (200_000, 3_000_000, 40_000)):
+        local = np.sort(rng.integers(0, 2000, n))
+        t_row = rng.integers(0, t_max, n)
+        diag = rng.integers(-d_span, d_span, n)
+        strat = rng.integers(0, 32, n)
+        got = _sort_rows(local, t_row, diag, strat)
+        want = np.lexsort((strat, diag, t_row, local))
+        for a in (local, t_row, diag, strat):
+            assert np.array_equal(a[got], a[want])
+    # Ranges whose product passes int64: the lexsort, row for row.
+    big = np.array([0, 2**40, 5, 2**40], dtype=np.int64)
+    small = np.array([3, 1, 2, 0], dtype=np.int64)
+    assert np.array_equal(
+        _sort_rows(small, big, big, small), np.lexsort((small, big, big, small))
+    )

@@ -245,3 +245,83 @@ def test_member_alleles_is_unchanged_by_the_vectorised_blocks(seed, ins_rate):
         assert np.array_equal(
             member_alleles(cres, cols), _reference_member_alleles(cres, cols)
         )
+
+
+def test_dense_states_is_its_loop() -> None:
+    """The vectorized `dense_states` gives the entry-by-entry loop's matrix:
+    columns asked in any order or repeated, repeated entries of one read."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.covariance import (
+        ReadStates,
+        _dense_states_loop,
+        dense_states,
+    )
+
+    rng = np.random.default_rng(17)
+    for _ in range(300):
+        m, v_n = int(rng.integers(0, 60)), int(rng.integers(1, 40))
+        counts = rng.integers(0, 8, m)
+        ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+        nnz = int(ptr[-1])
+        lo = rng.integers(0, v_n, m).astype(np.int32)
+        hi = (lo + rng.integers(0, v_n, m)).clip(max=v_n).astype(np.int32)
+        states = ReadStates(
+            ptr=ptr,
+            v=rng.integers(0, v_n, nnz).astype(np.int32),
+            state=rng.integers(1, 7, nnz).astype(np.int8),
+            obs_lo=lo,
+            obs_hi=hi,
+            weight=np.ones(m),
+            is_coverage=rng.random(v_n) < 0.3,
+            n_members=m,
+            n_candidates=v_n,
+        )
+        cols = rng.integers(0, v_n, int(rng.integers(0, v_n + 5)))
+        assert np.array_equal(dense_states(states, cols), _dense_states_loop(states, cols))
+
+
+def test_reestimate_is_its_loop() -> None:
+    """One weighted bincount gives the per-(pattern, column) loop's
+    majorities bit for bit, labels out of range and unseen cells included."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.covariance import (
+        _reestimate,
+        _reestimate_loop,
+    )
+
+    rng = np.random.default_rng(19)
+    for _ in range(300):
+        m, s, k = int(rng.integers(1, 80)), int(rng.integers(1, 30)), int(rng.integers(1, 6))
+        x = rng.integers(0, 7, (m, s)).astype(np.int8)
+        observed = rng.random((m, s)) < 0.7
+        labels = rng.integers(-1, k + 1, m).astype(np.int32)
+        w = rng.choice([1.0, 0.5, 0.1, 0.0, 1 / 3], m)
+        patterns = rng.integers(0, 7, (k, s)).astype(np.int8)
+        assert np.array_equal(
+            _reestimate(x, observed, labels, w, patterns),
+            _reestimate_loop(x, observed, labels, w, patterns),
+        )
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_a_child_from_reused_projections_is_the_child_from_scratch(seed) -> None:
+    """A split child built on the pooled plan from the pool's projections of
+    its reads equals the child that projects them itself."""
+    template, members = _members(seed, 40, 900, 0.01)
+    pooled = frame_consensus(template, members, frame_weight=0.0)
+    idx = np.random.default_rng(seed).choice(len(members), size=17, replace=False)
+    hap = [members[int(i)] for i in idx]
+    scratch = frame_consensus(template, hap, frame_weight=0.0, plan=pooled.plan)
+    reused = frame_consensus(
+        template,
+        hap,
+        frame_weight=0.0,
+        plan=pooled.plan,
+        projections=[pooled.projections[int(i)] for i in idx],
+        member_codes=[pooled.member_codes[int(i)] for i in idx],
+    )
+    assert reused.consensus == scratch.consensus
+    assert np.array_equal(reused.pwm, scratch.pwm)
+    assert np.array_equal(reused.winner, scratch.winner)
+    assert reused.alignments == scratch.alignments
+    with pytest.raises(ValueError):
+        frame_consensus(template, hap, plan=pooled.plan, projections=pooled.projections[:3],
+                        member_codes=pooled.member_codes[:3])

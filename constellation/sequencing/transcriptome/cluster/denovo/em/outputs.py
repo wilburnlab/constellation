@@ -217,7 +217,7 @@ def build_cluster_tables(
     clusters = pa.table(
         {
             "cluster_id": pa.array(np.arange(n, dtype=np.int64)),
-            "representative_read_id": pa.array(rep_read, pa.string()),
+            "representative_read_id": rep_read,
             "n_reads": pa.array(counts),
             "identity_threshold": pa.array(
                 np.full(n, identity_threshold, dtype=np.float32)
@@ -321,7 +321,11 @@ def _read_facts(assignments: pa.Table, read_row: np.ndarray):
     """
     n = read_row.size
     if assignments is None or assignments.num_rows == 0 or n == 0:
-        return [""] * n, np.full(n, -1, np.int64), np.zeros(n, np.int64)
+        return (
+            pa.array([""] * n, pa.string()),
+            np.full(n, -1, np.int64),
+            np.zeros(n, np.int64),
+        )
     rows = assignments.column("read_row").to_numpy(zero_copy_only=False).astype(
         np.int64
     )
@@ -332,8 +336,12 @@ def _read_facts(assignments: pa.Table, read_row: np.ndarray):
     valid = take >= 0
     idx = np.where(valid, take, 0)
 
-    ids = assignments.column("read_id").to_pylist()
-    read_id = [ids[int(i)] if v else "" for i, v in zip(idx, valid)]
+    # Arrow, not a list of Python strings: one per read of the run (9.4M).
+    read_id = pc.if_else(
+        pa.array(valid),
+        _string_column(assignments.column("read_id")).take(pa.array(idx)),
+        pa.scalar("", pa.string()),
+    )
     sample = assignments.column("sample_id")
     sample_np = pc.fill_null(sample, -1).to_numpy(zero_copy_only=False).astype(np.int64)
     q_end = assignments.column("q_end").to_numpy(zero_copy_only=False).astype(np.int64)
@@ -349,14 +357,14 @@ def _read_facts(assignments: pa.Table, read_row: np.ndarray):
 
 def _representative_per_cluster(
     assignments: pa.Table, cluster_id: np.ndarray, read_row: np.ndarray, n: int
-) -> list[str]:
-    """The best-scoring read of each cluster.
+) -> pa.Array:
+    """The best-scoring read of each cluster ("" for a cluster without one).
 
     From round 2 the frame is a consensus with no read of its own, so there is
     nothing to inherit; the schema requires a non-null representative, and the
     read that fits the consensus best is the honest choice.
     """
-    rep = [""] * n
+    rep = pa.array([""] * n, pa.string())
     if cluster_id.size == 0 or assignments is None or assignments.num_rows == 0:
         return rep
     rows = assignments.column("read_row").to_numpy(zero_copy_only=False).astype(
@@ -370,14 +378,25 @@ def _representative_per_cluster(
     if not valid.any():
         return rep
     score = assignments.column("as_score").to_numpy(zero_copy_only=False)
-    ids = assignments.column("read_id").to_pylist()
     c, t = cluster_id[valid], take[valid]
     order = np.lexsort((-score[t], c))
     first = np.flatnonzero(np.concatenate([[True], c[order][1:] != c[order][:-1]]))
-    for pos in first:
-        k = int(order[pos])
-        rep[int(c[k])] = ids[int(t[k])]
-    return rep
+    k = order[first]
+    best = np.full(n, -1, dtype=np.int64)
+    best[c[k]] = t[k]
+    has = best >= 0
+    return pc.if_else(
+        pa.array(has),
+        _string_column(assignments.column("read_id")).take(pa.array(np.where(has, best, 0))),
+        pa.scalar("", pa.string()),
+    )
+
+
+def _string_column(col) -> pa.Array:
+    """A read-id column as one ``string`` array."""
+    if isinstance(col, pa.ChunkedArray):
+        col = col.combine_chunks() if col.num_chunks != 1 else col.chunk(0)
+    return col.cast(pa.string()) if col.type != pa.string() else col
 
 
 def _unique_sequences_per_cluster(
@@ -412,20 +431,20 @@ def _unique_sequences_per_cluster(
 
 def _membership(
     cluster_id: np.ndarray,
-    read_id: list[str],
+    read_id: pa.Array,
     span: np.ndarray,
-    rep_read: list[str],
+    rep_read: pa.Array,
 ) -> pa.Table:
     m = cluster_id.size
     if m == 0:
         return CLUSTER_MEMBERSHIP_TABLE.empty_table()
-    is_rep = np.array(
-        [rid == rep_read[int(c)] for rid, c in zip(read_id, cluster_id)], dtype=bool
-    )
+    is_rep = pc.fill_null(
+        pc.equal(read_id, rep_read.take(pa.array(cluster_id))), False
+    ).to_numpy(zero_copy_only=False)
     return pa.table(
         {
             "cluster_id": pa.array(cluster_id),
-            "read_id": pa.array(read_id, pa.string()),
+            "read_id": read_id,
             "role": pa.array(
                 np.where(is_rep, "representative", "member"), pa.string()
             ),

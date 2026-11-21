@@ -1,4 +1,6 @@
-// Pan, zoom, brush, click and hover on one continuous axis.
+// Pan, zoom, brush, click and hover on one continuous axis — and, in
+// attachPanZoom2D below, on two axes zoomed independently (a read matrix:
+// columns across, reads down).
 //
 // Wheel zooms about the cursor (a mostly horizontal scroll pans), a drag
 // pans, shift-drag selects a range to zoom to, double-click fits, and a
@@ -139,6 +141,169 @@ export function attachPanZoom1D(opts: PanZoom1DOptions): () => void {
     if (opts.doubleClickFits === false || opts.ignore?.(e.target)) return;
     const limits = opts.limits();
     opts.set(opts.fit?.() ?? [limits.min, limits.max], 'reset');
+  };
+
+  surface.addEventListener('wheel', onWheel, { passive: false });
+  surface.addEventListener('pointerdown', onDown);
+  surface.addEventListener('pointermove', onMove);
+  surface.addEventListener('pointerup', finish);
+  surface.addEventListener('pointercancel', onCancel);
+  surface.addEventListener('pointerleave', onLeave);
+  surface.addEventListener('dblclick', onDouble);
+  return () => {
+    surface.removeEventListener('wheel', onWheel);
+    surface.removeEventListener('pointerdown', onDown);
+    surface.removeEventListener('pointermove', onMove);
+    surface.removeEventListener('pointerup', finish);
+    surface.removeEventListener('pointercancel', onCancel);
+    surface.removeEventListener('pointerleave', onLeave);
+    surface.removeEventListener('dblclick', onDouble);
+  };
+}
+
+// ── two axes ──────────────────────────────────────────────────────────
+
+/** The x and y intervals of a 2-D view. y grows downward (a row index). */
+export interface View2D {
+  x: Interval;
+  y: Interval;
+}
+
+export type PanZoom2DCause = 'wheel' | 'drag' | 'reset';
+
+export interface PanZoom2DOptions {
+  surface: HTMLElement;
+  /** The data area in client coordinates. */
+  plotRect(): { left: number; top: number; width: number; height: number };
+  get(): View2D;
+  set(next: View2D, cause: PanZoom2DCause): void;
+  limitsX(): IntervalLimits;
+  limitsY(): IntervalLimits;
+  /** What double-click fits to; both axes' limits when omitted. */
+  fit?(): View2D;
+  /** Zoom factor per wheel notch (default 1.2). */
+  wheelStep?: number;
+  onClick?(x: number, y: number, event: PointerEvent): void;
+  /** The data point under the cursor, `null` when it leaves. */
+  onHover?(at: { x: number; y: number } | null): void;
+  /** As in {@link PanZoom1DOptions.ignore}. */
+  ignore?(target: EventTarget | null): boolean;
+  /** Double-click fits (default true). */
+  doubleClickFits?: boolean;
+}
+
+/** Which axes one wheel event zooms or pans, and by how much. Pure, so
+ *  the gesture grammar is tested without events:
+ *
+ *  - plain wheel: zoom x about the cursor;
+ *  - shift + wheel: zoom y. Tested BEFORE a horizontal delta, because
+ *    Chrome (and Windows generally) deliver shift + wheel as `deltaX`
+ *    with `deltaY` 0 — read as a horizontal scroll it would pan;
+ *  - ctrl (or meta) + wheel: zoom both (a trackpad pinch arrives so);
+ *  - a mostly horizontal delta with no modifier: pan x (a trackpad's
+ *    sideways swipe).
+ */
+export function wheelGesture(e: {
+  deltaX: number;
+  deltaY: number;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  metaKey?: boolean;
+}): { kind: 'zoom'; axes: 'x' | 'y' | 'both'; outward: boolean } | { kind: 'pan-x'; delta: number } {
+  if (e.shiftKey) {
+    const d = e.deltaY !== 0 ? e.deltaY : e.deltaX;
+    return { kind: 'zoom', axes: 'y', outward: d > 0 };
+  }
+  if (e.ctrlKey || e.metaKey) return { kind: 'zoom', axes: 'both', outward: e.deltaY > 0 };
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return { kind: 'pan-x', delta: e.deltaX };
+  return { kind: 'zoom', axes: 'x', outward: e.deltaY > 0 };
+}
+
+export function attachPanZoom2D(opts: PanZoom2DOptions): () => void {
+  const { surface } = opts;
+  const step = opts.wheelStep ?? 1.2;
+  let press: { pointerId: number; x0: number; y0: number; view: View2D; moved: boolean } | null =
+    null;
+
+  const fractions = (clientX: number, clientY: number): [number, number] => {
+    const r = opts.plotRect();
+    return [
+      r.width > 0 ? (clientX - r.left) / r.width : 0.5,
+      r.height > 0 ? (clientY - r.top) / r.height : 0.5,
+    ];
+  };
+  const valueAt = (clientX: number, clientY: number, view: View2D = opts.get()) => {
+    const [fx, fy] = fractions(clientX, clientY);
+    return {
+      x: view.x[0] + fx * (view.x[1] - view.x[0]),
+      y: view.y[0] + fy * (view.y[1] - view.y[0]),
+    };
+  };
+
+  const onWheel = (e: WheelEvent): void => {
+    e.preventDefault();
+    const view = opts.get();
+    const g = wheelGesture(e);
+    if (g.kind === 'pan-x') {
+      const width = Math.max(1, opts.plotRect().width);
+      opts.set({ x: panBy(view.x, g.delta / width, opts.limitsX()), y: view.y }, 'wheel');
+      return;
+    }
+    const factor = g.outward ? step : 1 / step;
+    const [fx, fy] = fractions(e.clientX, e.clientY);
+    const x = g.axes === 'y' ? view.x : zoomAbout(view.x, factor, fx, opts.limitsX());
+    const y = g.axes === 'x' ? view.y : zoomAbout(view.y, factor, fy, opts.limitsY());
+    opts.set({ x, y }, 'wheel');
+  };
+
+  const onDown = (e: PointerEvent): void => {
+    if (e.button !== 0 || opts.ignore?.(e.target)) return;
+    press = { pointerId: e.pointerId, x0: e.clientX, y0: e.clientY, view: opts.get(), moved: false };
+    surface.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  };
+
+  const onMove = (e: PointerEvent): void => {
+    if (!press) {
+      opts.onHover?.(valueAt(e.clientX, e.clientY));
+      return;
+    }
+    const dx = e.clientX - press.x0;
+    const dy = e.clientY - press.y0;
+    if (Math.hypot(dx, dy) >= CLICK_SLOP_PX) press.moved = true;
+    if (!press.moved) return;
+    const r = opts.plotRect();
+    opts.set(
+      {
+        x: panBy(press.view.x, -dx / Math.max(1, r.width), opts.limitsX()),
+        y: panBy(press.view.y, -dy / Math.max(1, r.height), opts.limitsY()),
+      },
+      'drag',
+    );
+  };
+
+  const finish = (e: PointerEvent): void => {
+    if (!press || e.pointerId !== press.pointerId) return;
+    const { moved, x0, y0, view } = press;
+    surface.releasePointerCapture?.(press.pointerId);
+    press = null;
+    if (!moved) {
+      const at = valueAt(x0, y0, view);
+      opts.onClick?.(at.x, at.y, e);
+    }
+  };
+
+  const onCancel = (e: PointerEvent): void => {
+    if (press && e.pointerId === press.pointerId) press = null;
+  };
+  const onLeave = (): void => {
+    if (!press) opts.onHover?.(null);
+  };
+  const onDouble = (e: MouseEvent): void => {
+    if (opts.doubleClickFits === false || opts.ignore?.(e.target)) return;
+    const lx = opts.limitsX();
+    const ly = opts.limitsY();
+    opts.set(opts.fit?.() ?? { x: [lx.min, lx.max], y: [ly.min, ly.max] }, 'reset');
   };
 
   surface.addEventListener('wheel', onWheel, { passive: false });

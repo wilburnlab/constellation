@@ -58,6 +58,7 @@ from constellation.core.sequence.nucleic import (
     complement,
     find_orfs,
     gc_content,
+    longest_orf,
     reverse_complement,
     translate,
 )
@@ -150,6 +151,7 @@ __all__ = [
     "translate",
     "Orf",
     "find_orfs",
+    "longest_orf",
     "best_orf",
     "gc_content",
     # protein

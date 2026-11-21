@@ -346,9 +346,13 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     (rounds / "r01" / "_SUCCESS").write_bytes(b"")
     with pytest.raises(ValueError, match="p_floor_quality_scale"):
         _check_estep_stamp(rounds, _params(p_floor_quality_scale=1.5), resume=True)
-    # A stampless directory reads as the defaults, so the default passes...
+    # A stampless directory reads as the defaults of its day: no extent rule
+    # (before 2026-11-20), so today's tolerance is refused by name...
     (rounds / "estep.json").unlink()
-    _check_estep_stamp(rounds, _params(), resume=True)
+    with pytest.raises(ValueError, match="end_tolerance"):
+        _check_estep_stamp(rounds, _params(), resume=True)
+    # ...and the rule turned off passes.
+    _check_estep_stamp(rounds, _params(end_tolerance=None), resume=True)
     # ...and a two-pass run stamped before the shortlist keys existed ran
     # the old 16-deep shortlist, so the new 32 default refuses it unless
     # the old value is restored.
@@ -357,14 +361,16 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     (edlib_dir / "r01" / "_SUCCESS").write_bytes(b"")
     (edlib_dir / "estep.json").write_text(json.dumps({"estep_aligner": "edlib"}))
     with pytest.raises(ValueError, match="estep_shortlist_k"):
-        _check_estep_stamp(edlib_dir, _params(estep_aligner="edlib"), resume=True)
+        _check_estep_stamp(
+            edlib_dir, _params(estep_aligner="edlib", end_tolerance=None), resume=True
+        )
     # Restoring the old depth is not enough for THAT run: it also predates
     # the placement guard (review of 91e7c69), a rule with no flag to restore.
     (edlib_dir / "estep.json").write_text(json.dumps({"estep_aligner": "edlib"}))
     with pytest.raises(ValueError, match="earlier two-pass"):
         _check_estep_stamp(
             edlib_dir,
-            _params(estep_aligner="edlib", estep_shortlist_k=16),
+            _params(estep_aligner="edlib", estep_shortlist_k=16, end_tolerance=None),
             resume=True,
         )
     # A run stamped under today's rules resumes at whatever depth it ran.
@@ -380,7 +386,7 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     )
     _check_estep_stamp(
         edlib_dir,
-        _params(estep_aligner="edlib", estep_shortlist_k=16),
+        _params(estep_aligner="edlib", estep_shortlist_k=16, end_tolerance=None),
         resume=True,
     )
     # The single-pass minimap2 path is not what changed, and is not stamped.
@@ -896,7 +902,10 @@ def test_the_seeding_mode_reaches_the_manifest(corpus_dir, tmp_path):
     manifest = json.loads((out / "manifest.json").read_text())
     params = manifest["parameters"]
     assert params["seeding"] == "kmer"
-    assert params["seed_max_3p_overhang"] == 100
+    # Unset, the seed overhangs follow the end tolerance (100 at 3' before
+    # 2026-11-20, with the 5' end unbounded).
+    assert params["end_tolerance"] == 30
+    assert params["seed_max_5p_overhang"] == params["seed_max_3p_overhang"] == 30
     # The mode COLUMN stays "em": the mechanism is the EM loop, the seeder is
     # a parameter of it, and widening the column would touch every consumer.
     assert params["mode"] == "em"

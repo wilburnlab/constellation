@@ -13,6 +13,9 @@ Subcommands:
   [...]`` (or ``--saved-session <slug>``) — mass-spec browser over
   converted acquisitions and what searches found in them: chromatograms
   and spectra by MS level.
+- ``constellation viz transcriptome --run DIR [...]`` (or
+  ``--saved-session <slug>``) — transcriptome browser over de novo EM runs:
+  their clusters, and the read support behind any one of them.
 - ``constellation viz install-frontend --from <tarball>`` — extract a
   prebuilt frontend bundle into the package's ``static/<entry>/`` dir.
   Used by source-checkout / HPC installs where the JS toolchain isn't
@@ -144,6 +147,44 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     _add_server_arguments(p_ms)
     p_ms.set_defaults(func=cmd_viz_massspec)
+
+    p_tx = viz_subs.add_parser(
+        "transcriptome",
+        help="transcriptome browser over de novo EM runs (clusters and their read support)",
+    )
+    p_tx.add_argument(
+        "--run",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "an EM run: the directory `transcriptome cluster --mode em-orf / em-kmer` "
+            "writes. Repeatable."
+        ),
+    )
+    p_tx.add_argument(
+        "--demux-dir",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "the runs' demultiplexing directory, for sample names, when it is not "
+            "where their manifest says (a run made elsewhere and copied here)."
+        ),
+    )
+    p_tx.add_argument(
+        "--saved-session",
+        default=None,
+        help="open a saved session by slug (see `~/.constellation/sessions/`).",
+    )
+    p_tx.add_argument(
+        "--label",
+        default=None,
+        help="human-readable label for the session (default: the first run's name).",
+    )
+    _add_server_arguments(p_tx)
+    p_tx.set_defaults(func=cmd_viz_transcriptome)
 
     p_install = viz_subs.add_parser(
         "install-frontend",
@@ -573,6 +614,65 @@ def cmd_viz_massspec(args: argparse.Namespace) -> int:
             ("searched", str(sum(bool(a.links) for a in session.acquisitions))),
         ],
         default_entry="massspec",
+    )
+
+
+def cmd_viz_transcriptome(args: argparse.Namespace) -> int:
+    """Handler for ``viz transcriptome``: a saved session, or the runs given."""
+    from constellation.viz.modalities.transcriptome.session import (
+        TranscriptomeSession,
+        session_from_saved,
+    )
+    from constellation.viz.sessions import read_saved
+
+    runs = list(args.run or [])
+    if args.saved_session is not None:
+        if runs:
+            print("error: --saved-session is mutually exclusive with --run", file=sys.stderr)
+            return 2
+        try:
+            saved = read_saved(args.saved_session)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if saved.modality != TranscriptomeSession.modality:
+            print(
+                f"error: saved session {args.saved_session!r} is a {saved.modality!r} "
+                f"session; `viz transcriptome` opens transcriptome sessions only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            session = session_from_saved(saved)
+        except ValueError as exc:
+            print(f"error opening saved session: {exc}", file=sys.stderr)
+            return 1
+    else:
+        if not runs:
+            print("error: pass --saved-session <slug>, or at least one --run DIR", file=sys.stderr)
+            return 2
+        demux = str(args.demux_dir) if args.demux_dir else None
+        try:
+            session = TranscriptomeSession.open(
+                sources=[{"path": str(p), "demux_dir": demux} for p in runs],
+                label=args.label,
+            )
+        except ValueError as exc:
+            print(f"error opening session: {exc}", file=sys.stderr)
+            return 1
+
+    return _serve(
+        args,
+        session,
+        title="transcriptome",
+        details=[
+            ("runs", ", ".join(r.label for r in session.runs) or "none"),
+            (
+                "clusters",
+                ", ".join(f"{r.info.get('n_clusters', 0):,}" for r in session.runs) or "0",
+            ),
+        ],
+        default_entry="transcriptome",
     )
 
 

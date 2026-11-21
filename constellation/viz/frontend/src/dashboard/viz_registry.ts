@@ -148,6 +148,40 @@ const VIZ_DESCRIPTORS: VizDescriptor[] = [
       return { title: `mass spec · ${session.label}`, dispose: () => browser.dispose() };
     },
   },
+  {
+    path: ['viz', 'transcriptome'],
+    label: 'Transcriptome browser',
+    helpText:
+      'Clusters of a de novo EM run (the directory `transcriptome cluster --mode em-orf / ' +
+      'em-kmer` writes) and the reads behind any one of them.',
+    submitLabel: 'Open',
+    fields: [
+      { name: 'run', label: 'EM run', kind: 'dir', required: true, remember: true },
+      {
+        name: 'demux_dir',
+        label: 'Demultiplexing directory',
+        kind: 'dir',
+        placeholder: 'only when not where the run’s manifest says (for sample names)',
+        remember: true,
+      },
+    ],
+    async open(host, values) {
+      const demux = (values.demux_dir ?? '').trim();
+      const session = await fetchJsonMethod<{ session_id: string; label: string }>(
+        '/api/sessions/open',
+        'POST',
+        {
+          modality: 'transcriptome',
+          sources: [{ path: values.run.trim(), ...(demux ? { demux_dir: demux } : {}) }],
+        },
+      );
+      const { TranscriptomeBrowser } = await import('../modalities/transcriptome/TranscriptomeBrowser');
+      host.innerHTML = '';
+      const browser = new TranscriptomeBrowser({ host, sessionId: session.session_id });
+      await browser.mount();
+      return { title: `transcriptome · ${session.label}`, dispose: () => browser.dispose() };
+    },
+  },
 ];
 
 export function findVizDescriptor(path: string[]): VizDescriptor | null {

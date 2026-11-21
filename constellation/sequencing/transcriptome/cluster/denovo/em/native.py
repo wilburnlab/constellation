@@ -508,6 +508,37 @@ def _window_scores(
     return hits, hits - np.cumsum(delta[:m])
 
 
+def _sort_rows(
+    local: np.ndarray, t_row: np.ndarray, diag: np.ndarray, strat: np.ndarray
+) -> np.ndarray:
+    """The order of rows by ``(local, t_row, diag, strat)``.
+
+    One int64 key in mixed radix over the four fields' actual ranges, sorted
+    once, where a four-key ``lexsort`` sorted four times (6.8 of a 15-27 s
+    expansion of 16M rows under ORF seeding). Rows tied on all four keys
+    are identical in every column the caller keeps (one probe per stratum
+    fixes the read position; the diagonal then fixes the template position),
+    so their order among themselves cannot matter. A product of ranges past
+    int64 falls back to the ``lexsort``.
+    """
+    if local.shape[0] == 0:
+        return np.empty(0, dtype=np.int64)
+    d_lo = int(diag.min())
+    radix = (
+        int(t_row.max()) + 1,
+        int(diag.max()) - d_lo + 1,
+        int(strat.max()) + 1,
+    )
+    if (int(local.max()) + 1) * radix[0] * radix[1] * radix[2] >= 2**63:
+        return np.lexsort((strat, diag, t_row, local))
+    key = local.astype(np.int64) * radix[0] + t_row
+    key *= radix[1]
+    key += diag - d_lo
+    key *= radix[2]
+    key += strat
+    return np.argsort(key)
+
+
 def _expand_and_window(
     probe: np.ndarray,
     pb: np.ndarray,
@@ -550,7 +581,7 @@ def _expand_and_window(
     diag = t_pos - pos_q
 
     # ── dedupe on (read, template, probe, diagonal) ──
-    order = np.lexsort((strat, diag, t_row, local))
+    order = _sort_rows(local, t_row, diag, strat)
     local, t_row, diag, pos_q, strat, anchor_only_probe = (
         a[order] for a in (local, t_row, diag, pos_q, strat, anchor_only_probe)
     )
