@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,6 +56,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from constellation.massspec.acquisition_structure import scan_kinds
 from constellation.massspec.bundle import (
     BUNDLE_SCHEMA_VERSION,
     MANIFEST_FILENAME,
@@ -85,8 +85,6 @@ ION_TRAP = "ITMS"
 #: How far from a grid index, as a fraction of the step, a point may sit.
 OFF_GRID_TOLERANCE = 0.05
 
-_POLARITY = re.compile(r"^\s*\S+\s+([+-])\s")
-
 POINTS_SCHEMA = pa.schema(
     [
         pa.field("scan", pa.int32(), nullable=False),
@@ -97,53 +95,9 @@ POINTS_SCHEMA = pa.schema(
 )
 
 
-def _polarity(filters: list[str | None]) -> np.ndarray:
-    """``+`` / ``-`` from each filter string (``ITMS - p ESI ...``), ``?`` if absent."""
-    out = []
-    for f in filters:
-        m = _POLARITY.match(f or "")
-        out.append(m.group(1) if m else "?")
-    return np.asarray(out)
-
-
-def _codes(values: list[Any]) -> np.ndarray:
-    """An integer per distinct value (None included)."""
-    labels = np.asarray(["\x00" if v is None else str(v) for v in values])
-    return np.unique(labels, return_inverse=True)[1].astype(np.float64)
-
-
-def _numeric(table: pa.Table, name: str, decimals: int) -> np.ndarray:
-    values = table.column(name).to_numpy(zero_copy_only=False).astype(np.float64)
-    return np.where(np.isnan(values), -1.0, np.round(values, decimals))
-
-
 def group_scans(scans: pa.Table) -> tuple[np.ndarray, int]:
-    """Group number per scan row, groups numbered in order of first appearance.
-
-    Scans are alike when they share MS level, polarity, activation, collision
-    energy, precursor m/z, isolation window and scan range.
-    """
-    if scans.num_rows == 0:
-        return np.zeros(0, np.int64), 0
-    key = np.column_stack(
-        [
-            scans.column("level").to_numpy(zero_copy_only=False).astype(np.float64),
-            _codes(_polarity(scans.column("filter_string").to_pylist()).tolist()),
-            _codes(scans.column("activation_type").to_pylist()),
-            _numeric(scans, "collision_energy", 2),
-            _numeric(scans, "precursor_mz", 3),
-            _numeric(scans, "isolation_lower", 3),
-            _numeric(scans, "isolation_upper", 3),
-            _numeric(scans, "scan_window_lower", 3),
-            _numeric(scans, "scan_window_upper", 3),
-        ]
-    )
-    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
-    inverse = inverse.reshape(-1)
-    order = np.argsort(first, kind="stable")  # by first appearance
-    rank = np.empty_like(order)
-    rank[order] = np.arange(order.size)
-    return rank[inverse].astype(np.int64), int(order.size)
+    """Kind of scan per scan row (``acquisition_structure.scan_kinds``)."""
+    return scan_kinds(scans)
 
 
 def _ordinal_in_group(group: np.ndarray, n_groups: int) -> np.ndarray:

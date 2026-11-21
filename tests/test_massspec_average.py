@@ -15,10 +15,13 @@ import argparse
 import json
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from _massspec_fixtures import write_bundle, write_bundle_manifest
 
+from constellation.massspec.acquisition_structure import scan_kinds
+from constellation.massspec.schemas import SCAN_METADATA_TABLE
 from constellation.massspec.averaging import (
     POINTS_DIR,
     SUMMARY_FILENAME,
@@ -263,6 +266,67 @@ def test_scans_are_grouped_by_what_was_acquired(profile) -> None:
     assert n == 8
     assert np.bincount(group).tolist() == [5] * 8
     assert group[:8].tolist() == list(range(8))  # first cycle sets the order
+
+
+def _meta(rows: list[dict]) -> pa.Table:
+    return pa.Table.from_pylist(
+        [{"scan": i + 1, "level": 1, "analyzer": "ITMS", "scan_window_lower": 400.0, "scan_window_upper": 410.0, **r}
+         for i, r in enumerate(rows)],
+        schema=SCAN_METADATA_TABLE,
+    )
+
+
+class TestScanKinds:
+    def test_faims_voltages_are_kinds_of_their_own(self):
+        rows = [{"faims_cv": cv, "filter_string": f"ITMS + p NSI cv={cv:.2f} r Full ms [400.0000-410.0000]"}
+                for _ in range(3) for cv in (-45.0, -65.0)]
+        kind, n = scan_kinds(_meta(rows))
+        assert n == 2 and kind.tolist() == [0, 1] * 3
+
+    def test_a_voltage_alone_separates_scans_with_no_filter_string(self):
+        kind, n = scan_kinds(_meta([{"faims_cv": cv} for cv in (-45.0, -65.0, -45.0)]))
+        assert n == 2 and kind.tolist() == [0, 1, 0]
+
+    def test_scan_rates_are_kinds_of_their_own(self):
+        # Same range and level; the filter string's rate token (r rapid, n normal) differs, and so does the grid.
+        rows = [{"filter_string": f"ITMS + p NSI {rate} Full ms [400.0000-410.0000]"} for rate in "rnrn"]
+        kind, n = scan_kinds(_meta(rows))
+        assert n == 2 and kind.tolist() == [0, 1, 0, 1]
+
+    def test_polarities_are_kinds_of_their_own(self):
+        rows = [{"filter_string": f"ITMS {sign} p NSI r Full ms [400.0000-410.0000]"} for sign in "+-+"]
+        assert scan_kinds(_meta(rows))[0].tolist() == [0, 1, 0]
+
+    def test_last_digit_jitter_is_one_kind_and_order_is_first_appearance(self):
+        rows = [
+            {"level": 2, "precursor_mz": 600.0, "isolation_lower": 596.0, "isolation_upper": 604.0},
+            {"level": 2, "precursor_mz": 500.0, "isolation_lower": 496.0001, "isolation_upper": 504.0},
+            {"level": 2, "precursor_mz": 500.0, "isolation_lower": 496.0002, "isolation_upper": 504.0},
+            {"level": 2, "precursor_mz": 600.0, "isolation_lower": 596.0, "isolation_upper": 604.0},
+        ]
+        kind, n = scan_kinds(_meta(rows))
+        assert n == 2 and kind.tolist() == [0, 1, 1, 0]
+
+    def test_an_empty_table_has_no_kinds(self):
+        kind, n = scan_kinds(_meta([]))
+        assert n == 0 and kind.size == 0
+
+
+def test_a_faims_run_is_averaged_voltage_by_voltage(tmp_path):
+    scans = []
+    for _cycle in range(3):
+        for cv, level in ((-45.0, 1000.0), (-65.0, 10.0)):
+            scans.append({
+                "scan": len(scans) + 1, "level": 1, "rt": len(scans) * 0.5, "iit": 5.0, "tic": 1e6, "analyzer": "ITMS",
+                "faims_cv": cv, "filter_string": f"ITMS + p NSI cv={cv:.2f} r Full ms [400.0000-410.0000]",
+                "scan_window_lower": 400.0, "scan_window_upper": 410.0,
+                "mz": _jitter(GRID1), "intensity": np.full(GRID1.size, level),
+            })
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "f.profile", scans, profile=True), run="f")
+    points, _, meta, _ = _out(average_bundle(bundle))
+    assert [m["faims_cv"] for m in meta] == [-45.0, -65.0]
+    assert points["intensity"][points["scan"] == 1] == pytest.approx(1000.0)
+    assert points["intensity"][points["scan"] == 2] == pytest.approx(10.0)
 
 
 class TestCommand:

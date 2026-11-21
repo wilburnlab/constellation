@@ -1,4 +1,5 @@
-"""What kind of acquisition a run is, read off its MS2 isolation windows.
+"""What kind of acquisition a run is, read off its MS2 isolation windows,
+and which kinds of scan it repeats (:func:`scan_kinds`).
 
 Whether a run is DIA or DDA is a property of the data, not something a
 user should have to assert: a DIA run cycles through a small, fixed set
@@ -214,6 +215,58 @@ def refuse_unsupported(scan_metadata: pa.Table, where: str) -> None:
         raise ValueError(f"{where}: " + "; and ".join(reasons))
 
 
+#: What makes two scans one kind of scan, as text: the filter string is
+#: Thermo's own name for a kind of scan (polarity, scan rate, FAIMS voltage,
+#: activation and energy, precursor, scan range, MSX), which the typed columns
+#: below repeat for a bundle that has none (an imported spectra file).
+KIND_TEXT_COLUMNS: tuple[str, ...] = ("filter_string", "analyzer", "activation_type")
+#: ... and as numbers, each compared at the decimals given: finer than any two
+#: settings differ by, coarser than the last-digit jitter an instrument reports.
+KIND_NUMBER_COLUMNS: tuple[tuple[str, int], ...] = (
+    ("level", 0),
+    ("faims_cv", 2),
+    ("collision_energy", 2),
+    ("precursor_mz", 3),
+    ("isolation_lower", 3),
+    ("isolation_upper", 3),
+    ("scan_window_lower", 3),
+    ("scan_window_upper", 3),
+)
+
+
+def scan_kinds(scan_metadata: pa.Table) -> tuple[np.ndarray, int]:
+    """Each scan's kind of scan, and how many kinds there are.
+
+    Two scans are of one kind when they were acquired the same way: the same
+    filter string, analyzer, activation, MS level, collision energy, FAIMS
+    compensation voltage, precursor m/z, isolation window and scan range
+    (:data:`KIND_TEXT_COLUMNS`, :data:`KIND_NUMBER_COLUMNS`; a column the table
+    lacks is left out, a null is a value of its own). A run that repeats one
+    scan has one kind; one that cycles through several has one for each, and
+    a multi-CV FAIMS run has one per voltage. Kinds are numbered 0, 1, ... in
+    the order of their first scan.
+    """
+    n = scan_metadata.num_rows
+    if n == 0:
+        return np.zeros(0, np.int64), 0
+    names = set(scan_metadata.column_names)
+    parts = []
+    for name in KIND_TEXT_COLUMNS:
+        if name in names:
+            codes = pc.dictionary_encode(scan_metadata.column(name).combine_chunks()).indices
+            parts.append(pc.fill_null(codes, -1).to_numpy(zero_copy_only=False).astype(np.float64))
+    for name, decimals in KIND_NUMBER_COLUMNS:
+        if name in names:
+            values = scan_metadata.column(name).cast(pa.float64()).fill_null(np.inf).to_numpy(zero_copy_only=False)
+            parts.append(np.where(np.isnan(values), np.inf, np.round(values, decimals)))
+    key = np.column_stack(parts) if parts else np.zeros((n, 1))
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    order = np.argsort(first, kind="stable")  # kinds by their first scan
+    rank = np.empty_like(order)
+    rank[order] = np.arange(order.size)
+    return rank[inverse.reshape(-1)].astype(np.int64), int(order.size)
+
+
 def impute_injection_times(
     level: np.ndarray, iit: np.ndarray, tic: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -311,6 +364,8 @@ def read_acquired_ranges(bundle, *, level: int = 2) -> pa.Table:
 
 
 __all__ = [
+    "KIND_NUMBER_COLUMNS",
+    "KIND_TEXT_COLUMNS",
     "MIN_VISITS_PER_DIA_WINDOW",
     "AcquisitionStructure",
     "AcquisitionType",
@@ -321,5 +376,6 @@ __all__ = [
     "parent_scans",
     "read_acquired_ranges",
     "refuse_unsupported",
+    "scan_kinds",
     "unsupported",
 ]
