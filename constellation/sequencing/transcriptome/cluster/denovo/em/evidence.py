@@ -76,6 +76,9 @@ KERNEL_COUNTERS: tuple[str, ...] = (
     "n_coverage",
     "n_collapsed",
     "n_candidates_capped",
+    # Columns a route would have admitted that the M-step ruled out as
+    # terminal extensions (2026-11-24); null in rounds recorded before.
+    "n_excluded_extension",
     "n_pairs_seen",
     "n_tested_pairs",
     "n_significant_edges",

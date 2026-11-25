@@ -725,8 +725,10 @@ def section_mstep(em_dir: Path) -> ReportSection:
             prev_failed, prev_dir = set(), d
             continue
         cand = sig = None
+        n_ext = None
         failed_ids: set[int] = set()
         if t is not None and t.num_rows:
+            n_ext = _counter_sum(t, "n_excluded_extension")
             status = t.column("status").to_numpy(zero_copy_only=False)
             ids = t.column("template_id").to_numpy(zero_copy_only=False)
             failed_ids = set(
@@ -754,6 +756,7 @@ def section_mstep(em_dir: Path) -> ReportSection:
                 in_nodes,
                 _q(cand),
                 _q(sig),
+                n_ext,
             )
         )
         if n_failed:
@@ -780,21 +783,37 @@ def section_mstep(em_dir: Path) -> ReportSection:
         return ReportSection(title="M-step", body="_no M-step record_")
     lines = [
         "| round | templates | split | failed | no members | reads assigned "
-        "| in nodes | candidates (p50/p90) | significant edges (p50/p90) |",
-        "|---:|---:|---:|---:|---:|---:|---:|---|---|",
+        "| in nodes | candidates (p50/p90) | significant edges (p50/p90) "
+        "| end columns excluded |",
+        "|---:|---:|---:|---:|---:|---:|---:|---|---|---:|",
     ]
-    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig in rows:
+    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig, n_ext in rows:
         lines.append(
             f"| {r} | {_fmt(n)} | {_fmt(split)} | {_fmt(failed)} | {_fmt(nomem)} "
-            f"| {_fmt(assigned)} | {_fmt(in_nodes)} | {cand} | {sig} |"
+            f"| {_fmt(assigned)} | {_fmt(in_nodes)} | {cand} | {sig} "
+            f"| {_fmt(n_ext)} |"
         )
     body = "\n".join(lines) + (
         "\n\nCandidates and edges are over the templates that had any. "
         "*Failed* templates kept their reads in a fallback node — the pooled "
         "consensus with no split, or the template itself — rather than "
-        "leaving the round."
+        "leaving the round. *End columns excluded*: terminal extension "
+        "columns a route would have admitted, which are not candidates "
+        "(how far reads run past a template's end is extent, not a reason "
+        "to split); blank for rounds recorded before the rule."
     )
     return ReportSection(title="M-step", body=body, flags=flags)
+
+
+def _counter_sum(t, name: str) -> int | None:
+    """The sum of a nullable per-template counter; ``None`` when no template
+    of the round recorded it (a round from before the counter existed)."""
+    if name not in t.column_names:
+        return None
+    col = t.column(name)
+    if col.null_count == len(col):
+        return None
+    return int(col.drop_null().to_numpy(zero_copy_only=False).sum())
 
 
 def _fmt(v) -> str:

@@ -328,6 +328,9 @@ def _mstep_params(d: dict, cls):
     if "node_extent" in known and "node_extent" not in d:
         # Recorded before 2026-11-20: a node was every column its reads covered.
         d = {**d, "node_extent": "union"}
+    if "candidate_extensions" in known and "candidate_extensions" not in d:
+        # Recorded before 2026-11-24: terminal extension columns were candidates.
+        d = {**d, "candidate_extensions": True}
     unknown = sorted(set(d) - known)
     if unknown:
         raise ReplayError(

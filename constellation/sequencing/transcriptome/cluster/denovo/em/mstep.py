@@ -69,6 +69,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+    COL_EXT_3P,
+    COL_EXT_5P,
     ConsensusResult,
     MemberSpec,
     frame_consensus,
@@ -429,11 +431,26 @@ def refine_template_with_internals(
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
     node_extent: str = "union",
+    candidate_extensions: bool = False,
 ) -> tuple[list[RefinedTemplate], KernelInternals | None]:
     """:func:`refine_template`, also returning what it computed on the way.
 
     The one implementation of the M-step kernel: the round loop and replay
     both run it, so a replay cannot drift from the run it re-creates.
+
+    ``candidate_extensions=False`` (2026-11-24): a terminal extension column
+    of the pooled plan (``COL_EXT_5P`` / ``COL_EXT_3P``) is not a candidate.
+    Under the extent rule a read joins a template only with both ends within
+    the tolerance, so how far each read runs past the template's ends is
+    extent, the E-step's question, and never a reason to split. Yet a read
+    anchored at an end votes a gap in that end's extension block and a read
+    that runs past votes its own bases (``consensus._covers_junction``), so
+    every extension column reads as a base-versus-gap allele, and a set of
+    reads sharing an alternative start or cleavage site is a perfect clique
+    to the covariance test. On the Nov2026 run that split templates on
+    molecule ends whose children then differed only outside their median
+    extent. Interior insertion columns, at the first and last junctions
+    too, stay candidates. ``call_variants`` applies the same rule.
     """
     if not members:
         return [], None
@@ -457,6 +474,11 @@ def refine_template_with_internals(
         local_window=local_window,
         boundary_tolerance=boundary_tolerance,
     )
+    eligible = (
+        None
+        if candidate_extensions
+        else ~np.isin(stats.column_kind, (COL_EXT_5P, COL_EXT_3P))
+    )
     cand = candidate_columns(
         stats,
         f_min=f_min,
@@ -465,6 +487,7 @@ def refine_template_with_internals(
         overdispersion=overdispersion,
         max_columns=max_candidate_columns,
         coverage_route=coverage_route,
+        eligible=eligible,
     )
     internals = KernelInternals(pooled=pooled, stats=stats, cand=cand)
 
@@ -476,6 +499,7 @@ def refine_template_with_internals(
         "n_coverage": cand.n_coverage,
         "n_collapsed": cand.n_collapsed,
         "n_candidates_capped": cand.n_capped,
+        "n_excluded_extension": cand.n_excluded,
         "disagreements": disagreement_stats(pooled),
     }
 
@@ -635,6 +659,7 @@ def refine_template(
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
     node_extent: str = "union",
+    candidate_extensions: bool = False,
 ) -> list[RefinedTemplate]:
     """Refine one template into its state-tuple nodes.
 
@@ -667,6 +692,7 @@ def refine_template(
         min_insertion_support=min_insertion_support,
         min_extension_support=min_extension_support,
         node_extent=node_extent,
+        candidate_extensions=candidate_extensions,
     )
     return nodes
 

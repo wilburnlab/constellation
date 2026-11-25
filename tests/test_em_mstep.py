@@ -526,3 +526,110 @@ def test_a_run_recorded_before_node_extent_replays_as_union() -> None:
     assert _mstep_params(old, MStepParams).node_extent == "union"
     assert MStepParams().node_extent == "median"
     assert _mstep_params(dataclasses.asdict(MStepParams()), MStepParams).node_extent == "median"
+
+
+# ── molecule ends are extent, not a reason to split (2026-11-24) ──────
+
+
+def _at(frame: str, read: str, start: int, member_id: int, cigar: str | None = None):
+    """``read`` aligned to all of ``frame`` from read offset ``start``: the
+    read bases before ``start`` and after the frame are its 5'/3' flanks,
+    which is how the E-step's alignments reach the PWM."""
+    return MemberSpec(read, 1.0, cigar or f"{len(frame)}M", False, 0, start, member_id)
+
+
+def _ragged_ends(rng, frame: str, n: int, first_id: int = 0, body: str | None = None):
+    """``n`` reads of ``body`` (default ``frame``) in four end classes: a
+    quarter as the frame, a quarter running 3 nt past its 3' end, a quarter
+    12 nt past its 5' end, a quarter past both. The extent rule admits all of
+    them to one template; only the flanks differ."""
+    body = body or frame
+    ext5, ext3 = _rand(rng, 12), "GAT"
+    reads = []
+    for i in range(n):
+        five, three = (i % 4) in (2, 3), (i % 4) in (1, 3)
+        seq = (ext5 if five else "") + body + (ext3 if three else "")
+        reads.append(_at(frame, seq, 12 if five else 0, first_id + i))
+    return reads
+
+
+def test_molecule_end_variation_alone_does_not_split():
+    """The Nov2026 twins (Tubb4b 1378/1379): a template split by which reads
+    end one cleavage site later and which carry an alternative start. Every
+    one of those columns is a terminal extension; ruled out, the template is
+    one node. Admitted, as before, they split it."""
+    rng = np.random.default_rng(83)
+    frame = _rand(rng, 600)
+    members = _ragged_ends(rng, frame, 100)
+
+    nodes = refine_template(frame, members)
+    assert len(nodes) == 1
+    assert nodes[0].n_reads == 100
+    assert nodes[0].stats["n_excluded_extension"] > 0
+
+    before = refine_template(frame, members, candidate_extensions=True)
+    assert len(before) > 1
+    assert before[0].stats["n_excluded_extension"] == 0
+
+
+def test_an_interior_variant_near_an_end_still_splits():
+    """The Prm2 C/C pair: two linked substitutions 40 and 45 nt from the 5'
+    end in a minority, among reads whose ends vary. Only the interior pair
+    splits the template, and the minority node carries it."""
+    rng = np.random.default_rng(89)
+    frame = _rand(rng, 600)
+    alt = list(frame)
+    for p in (40, 45):
+        alt[p] = "A" if frame[p] != "A" else "C"
+    alt = "".join(alt)
+    members = _ragged_ends(rng, frame, 70) + _ragged_ends(
+        rng, frame, 30, first_id=70, body=alt
+    )
+
+    nodes = refine_template(frame, members)
+    assert sorted(n.n_reads for n in nodes) == [30, 70]
+    minor = min(nodes, key=lambda n: n.n_reads)
+    assert alt[30:60] in minor.consensus
+    assert frame[30:60] not in minor.consensus
+
+
+def test_an_insertion_at_the_first_interior_junction_is_still_a_candidate():
+    """Only the blocks before the template's first base and after its last are
+    extent. An insertion between its first two bases is an interior column
+    (``COL_INSERTED``) and stays a candidate."""
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+        COL_INSERTED,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        refine_template_with_internals,
+    )
+
+    rng = np.random.default_rng(97)
+    frame = _rand(rng, 600)
+    ins = "T" if frame[1] != "T" else "A"
+    sub = "A" if frame[300] != "A" else "C"
+    carrier = frame[0] + ins + frame[1:300] + sub + frame[301:]
+    members = [_at(frame, frame, 0, i) for i in range(70)] + [
+        _at(frame, carrier, 0, 70 + i, cigar="1M1I599M") for i in range(30)
+    ]
+    nodes, internals = refine_template_with_internals(frame, members)
+    kind = internals.pooled.column_kind
+    inserted = [c for c in internals.cand.columns.tolist() if kind[c] == COL_INSERTED]
+    assert inserted, "the first-junction insertion column is a candidate"
+    assert sorted(n.n_reads for n in nodes) == [30, 70]
+
+
+def test_a_run_recorded_before_the_extension_rule_replays_with_extensions() -> None:
+    import dataclasses
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import MStepParams
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import _mstep_params
+
+    old = {
+        k: v
+        for k, v in dataclasses.asdict(MStepParams()).items()
+        if k != "candidate_extensions"
+    }
+    assert _mstep_params(old, MStepParams).candidate_extensions is True
+    assert MStepParams().candidate_extensions is False
+    assert MStepParams().kernel_kwargs()["candidate_extensions"] is False

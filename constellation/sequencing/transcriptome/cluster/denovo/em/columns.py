@@ -80,7 +80,10 @@ class ColumnStats:
     eps: np.ndarray  # float64 — context-conditional null, after the floor
     is_gap: np.ndarray  # bool — either allele is a gap ⇒ length change
     is_hp: np.ndarray  # bool — …and it sits in a homopolymer
-    column_kind: np.ndarray  # int8 — DIAGNOSTICS ONLY, never a gate
+    # int8 — the plan's provenance of each column (consensus.COL_*). Not a
+    # gate here; the M-step derives ``candidate_columns``' ``eligible`` mask
+    # from it (terminal extension columns are not candidates).
+    column_kind: np.ndarray
     boundary: np.ndarray  # bool — a clustered span endpoint sits here
     boundary_mass: np.ndarray  # float64 — weight of spans ending/starting there
     # float64 — endpoint mass a LOCALLY UNIFORM spread would put in the same
@@ -126,6 +129,10 @@ class CandidateSet:
     n_collapsed: int  # columns folded away by run collapse
     n_capped: int  # candidates dropped by max_columns
     n_tested: int  # size of the BH family
+    # Columns either route would have admitted for testing that ``eligible``
+    # ruled out (the M-step: terminal extension columns). Counted, never
+    # silently dropped.
+    n_excluded: int = 0
 
 
 def _local_max(x: np.ndarray, window: int) -> np.ndarray:
@@ -384,8 +391,15 @@ def candidate_columns(
     collapse_runs: bool = True,
     max_columns: int | None = 512,
     coverage_route: bool = True,
+    eligible: np.ndarray | None = None,
 ) -> CandidateSet:
     """Admit columns for covariance testing.
+
+    ``eligible`` (``(F,)`` bool, optional) rules columns out on both routes
+    before anything is tested: an ineligible column is not in the
+    Benjamini–Hochberg family, so excluding it changes no other column's
+    multiplicity correction. The count of columns either route would have
+    admitted is ``n_excluded``.
 
     **Allelic route** — all three of: ``minor_frac ≥ f_min``,
     ``n_minor ≥ a_min``, and BH significance at ``q_candidate`` under
@@ -442,16 +456,40 @@ def candidate_columns(
     Only *pure*-coverage columns collapse. Two adjacent substitution columns
     may share a covered set and still be different alleles.
 
-    Not gated on here, deliberately, and all four still apply in
+    Not gated on here, deliberately, and all three still apply in
     ``call_variants`` for the components path: ``in_core`` / ``_core_region``,
-    the terminal-column exclusion, the indel FDR bypass, and the 64-column
-    cap.
+    the indel FDR bypass, and the 64-column cap. The fourth, the
+    terminal-column exclusion, is the M-step's too since the extent rule
+    (2026-11-20) made extent the E-step's question: it arrives as
+    ``eligible``.
     """
     depth = stats.depth
     f = stats.n_columns
 
+    if eligible is not None:
+        eligible = np.asarray(eligible, dtype=bool)
+        if eligible.shape != (f,):
+            raise ValueError(
+                f"eligible must have one value per column ({f}), got {eligible.shape}"
+            )
+
     # ── allelic ──
     testable = (stats.minor_frac >= f_min) & (stats.n_minor >= a_min) & (depth > 0)
+    # ── coverage ── (decided here so an exclusion can be counted on both)
+    ufl = stats.uncov_frac_local
+    ufg = stats.uncov_frac
+    if coverage_route:
+        in_local = (ufl >= f_min) & (ufl <= 1.0 - f_min)
+        in_global = (ufg >= f_min) & (ufg <= 1.0 - f_min)
+    else:
+        in_local = in_global = np.zeros(f, dtype=bool)
+    n_excluded = 0
+    if eligible is not None:
+        n_excluded = int(((testable | in_local | in_global) & ~eligible).sum())
+        testable &= eligible
+        in_local &= eligible
+        in_global &= eligible
+
     t_idx = np.flatnonzero(testable)
     p_value = np.ones(f, dtype=np.float64)
     q_cut = -1.0
@@ -464,14 +502,6 @@ def candidate_columns(
         sig, q_cut = benjamini_hochberg(p, q_candidate)
         allelic[t_idx[sig]] = True
 
-    # ── coverage ──
-    ufl = stats.uncov_frac_local
-    ufg = stats.uncov_frac
-    if coverage_route:
-        in_local = (ufl >= f_min) & (ufl <= 1.0 - f_min)
-        in_global = (ufg >= f_min) & (ufg <= 1.0 - f_min)
-    else:
-        in_local = in_global = np.zeros(f, dtype=bool)
     coverage = in_local | in_global
 
     cand = allelic | coverage
@@ -493,6 +523,7 @@ def candidate_columns(
             n_collapsed=0,
             n_capped=0,
             n_tested=int(t_idx.size),
+            n_excluded=n_excluded,
         )
 
     route = (allelic[cols] * ROUTE_ALLELIC + coverage[cols] * ROUTE_COVERAGE).astype(
@@ -574,6 +605,7 @@ def candidate_columns(
         n_collapsed=n_collapsed,
         n_capped=n_capped,
         n_tested=int(t_idx.size),
+        n_excluded=n_excluded,
     )
 
 
