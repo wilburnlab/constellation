@@ -1484,3 +1484,46 @@ def test_a_cluster_lists_the_reads_the_closing_fold_gave_it(runs, tmp_path):
     assert set(folded.column("read_id").to_pylist()) == reads_of(plain["cluster_id"])
     assert any("folded into it" in w for w in st.warnings)
     assert R.replay_summary(rep)["n_folded_reads"] == len(reads_of(plain["cluster_id"]))
+
+
+def test_a_round_recorded_before_a_counter_existed_still_verifies(
+    runs, tmp_path, split_template_id
+):
+    """`n_excluded_extension` and `n_folded_same` joined the template record on
+    2026-11-24. A round recorded before has no such column (null when read),
+    which is not a disagreement; replays of the Nov2026 run failed on exactly
+    that. A counter the round DID record is still checked."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        KERNEL_COUNTERS_ADDED,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        index_round,
+    )
+
+    out = tmp_path / "copy"
+    shutil.copytree(runs[1], out)
+    index = index_round(out / "rounds" / "r01")
+    unit = int(index.node_unit[index.node_rows_of(split_template_id)[0]])
+    path = index.shards["templates"][unit]
+    table = pq.read_table(path)
+    older = table.drop_columns(sorted(KERNEL_COUNTERS_ADDED))
+    pq.write_table(older, path)
+    rep = R.replay_template(out, 1, split_template_id)
+    assert rep.verified, rep.mismatch
+
+    mine = pa.compute.equal(table.column("template_id"), split_template_id).to_numpy(
+        zero_copy_only=False
+    )
+    wrong = table.column("n_folded_same").to_numpy(zero_copy_only=False).copy()
+    wrong[np.flatnonzero(mine)[0]] = 5
+    pq.write_table(
+        table.set_column(
+            table.schema.get_field_index("n_folded_same"),
+            "n_folded_same",
+            pa.array(wrong, pa.int64()),
+        ),
+        path,
+    )
+    rep = R.replay_template(out, 1, split_template_id)
+    assert "record n_folded_same differs" in rep.mismatch

@@ -573,7 +573,13 @@ def _verify_template(index: RoundIndex, rep: TemplateReplay) -> list[str]:
             for name in ("status", "n_assigned", "n_members_used", "n_nodes_emitted"):
                 if rec[name] != getattr(got, name):
                     out.append(f"record {name} differs")
+            from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+                KERNEL_COUNTERS_ADDED,
+            )
+
             for name, value in got.counters.items():
+                if rec.get(name) is None and name in KERNEL_COUNTERS_ADDED:
+                    continue  # a round recorded before the counter existed
                 if rec.get(name) != value:
                     out.append(f"record {name} differs")
     # The compact evidence the round wrote for this template — what the

@@ -93,6 +93,14 @@ KERNEL_COUNTERS: tuple[str, ...] = (
     "n_folded_same",
 )
 
+#: Counters added after runs had been recorded without them. A stored null
+#: for one of these means "not recorded", and replay does not compare it; a
+#: null for any other counter means the kernel did not get that far, which
+#: a replay must agree with.
+KERNEL_COUNTERS_ADDED: frozenset[str] = frozenset(
+    {"n_excluded_extension", "n_folded_same"}
+)
+
 MSTEP_TEMPLATE_TABLE: pa.Schema = pa.schema(
     [
         pa.field("round", pa.int32(), nullable=False),
@@ -484,6 +492,7 @@ __all__ = [
     "EVIDENCE_OK",
     "EVIDENCE_VERSION",
     "KERNEL_COUNTERS",
+    "KERNEL_COUNTERS_ADDED",
     "MSTEP_DISAGREEMENT_TABLE",
     "MSTEP_TEMPLATE_TABLE",
     "STATUSES",
