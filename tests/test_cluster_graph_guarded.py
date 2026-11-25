@@ -49,7 +49,7 @@ def _cover(
         tol_5p=tol_5p,
         tol_3p=tol_3p,
         origin=None if origin is None else np.asarray(origin, dtype=np.int64),
-        edge_identical=None if identical is None else np.asarray(identical, bool),
+        edge_kin_exempt=None if identical is None else np.asarray(identical, bool),
     )
 
 
@@ -383,7 +383,7 @@ def test_it_follows_the_specification_where_the_guards_bind(seed, kin_guard):
         origin = same = None
     tol = dict(tol_5p=30, tol_3p=30)
     res = guarded_set_cover(
-        n, order, a, b, o5, o3, origin=origin, edge_identical=same, **tol
+        n, order, a, b, o5, o3, origin=origin, edge_kin_exempt=same, **tol
     )
 
     label, centroids = _by_the_book(
@@ -415,7 +415,7 @@ def test_the_twin_exemption_is_exercised_by_the_randomized_cases():
             tol_5p=30,
             tol_3p=30,
             origin=origin,
-            edge_identical=same,
+            edge_kin_exempt=same,
         )
         for cid in range(res.centroid_uniq.shape[0]):
             kin = origin[res.cluster_of == cid]
@@ -430,7 +430,7 @@ def test_the_twin_exemption_is_exercised_by_the_randomized_cases():
 def test_the_result_does_not_depend_on_edge_order_or_orientation():
     n, order, a, b, o5, o3, origin, same = _binding_case(11)
     kw = dict(tol_5p=30, tol_3p=30, origin=origin)
-    base = guarded_set_cover(n, order, a, b, o5, o3, edge_identical=same, **kw)
+    base = guarded_set_cover(n, order, a, b, o5, o3, edge_kin_exempt=same, **kw)
 
     rng = np.random.default_rng(12)
     for _ in range(5):
@@ -443,7 +443,7 @@ def test_the_result_does_not_depend_on_edge_order_or_orientation():
             np.where(flip, a, b)[by],
             np.where(flip, -o5, o5)[by],
             np.where(flip, -o3, o3)[by],
-            edge_identical=same[by],
+            edge_kin_exempt=same[by],
             **kw,
         )
         np.testing.assert_array_equal(res.cluster_of, base.cluster_of)
@@ -454,7 +454,7 @@ def test_self_edges_and_repeated_pairs_change_nothing():
     """The repeats contradict their originals, so using one would show."""
     n, order, a, b, o5, o3, origin, same = _binding_case(21)
     kw = dict(tol_5p=30, tol_3p=30, origin=origin)
-    base = guarded_set_cover(n, order, a, b, o5, o3, edge_identical=same, **kw)
+    base = guarded_set_cover(n, order, a, b, o5, o3, edge_kin_exempt=same, **kw)
 
     rng = np.random.default_rng(22)
     again = rng.choice(a.shape[0], 300, replace=False)
@@ -467,7 +467,7 @@ def test_self_edges_and_repeated_pairs_change_nothing():
         np.concatenate([b, np.where(flip, a[again], b[again]), loops]),
         np.concatenate([o5, o5[again] + 100, np.full(50, 500)]),
         np.concatenate([o3, o3[again] - 100, np.full(50, -500)]),
-        edge_identical=np.concatenate([same, ~same[again], np.ones(50, bool)]),
+        edge_kin_exempt=np.concatenate([same, ~same[again], np.ones(50, bool)]),
         **kw,
     )
 

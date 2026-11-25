@@ -587,7 +587,7 @@ def _edges(rows):
         "dst_row": np.array([r[1] for r in full], dtype=np.int64),
         "off_5p": np.array([r[2] for r in full], dtype=np.int64),
         "off_3p": np.array([r[3] for r in full], dtype=np.int64),
-        "identical": np.array([r[4] for r in full], dtype=bool),
+        "kin_exempt": np.array([r[4] for r in full], dtype=bool),
     }
 
 
@@ -611,7 +611,7 @@ def _survivors(rows, n_reads, seq_len, **kw):
         e["off_3p"],
         np.asarray(n_reads),
         np.asarray(seq_len),
-        identical=e["identical"],
+        kin_exempt=e["kin_exempt"],
         **{**_TOL, **kw},
     ).tolist()
 
@@ -653,7 +653,8 @@ def test_a_hub_does_not_join_two_split_siblings():
     assert _survivors(rows, reads, length, origin=origin) == [2, 1, 2]
     # --merge-siblings switches the kin guard off by passing no origin.
     assert _survivors(rows, reads, length, origin=None) == [2, 2, 2]
-    # Byte-identical siblings cannot be told apart by reads, so they merge.
+    # Siblings the merge marks kin-exempt (the same: no edits, ends within
+    # the tolerance) were separated by nothing, so they merge.
     twins = [(2, 0, 0, 0, True), (2, 1, 0, 0, True)]
     assert _survivors(twins, reads, length, origin=origin) == [2, 2, 2]
 

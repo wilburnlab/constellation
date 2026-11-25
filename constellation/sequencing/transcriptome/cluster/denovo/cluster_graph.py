@@ -158,7 +158,7 @@ def guarded_set_cover(
     tol_5p: int,
     tol_3p: int,
     origin: np.ndarray | None = None,
-    edge_identical: np.ndarray | None = None,
+    edge_kin_exempt: np.ndarray | None = None,
 ) -> ComponentResult:
     """Radius-1 greedy set cover whose merge guards hold per **group**.
 
@@ -187,9 +187,12 @@ def guarded_set_cover(
 
     **Kin guard** (``origin`` given; ``-1`` = no recorded split). A neighbour
     whose origin is already in the group is refused unless it and every member
-    holding that origin are byte-identical to the claimant
-    (``edge_identical``; the claimant is identical to itself). Reads cannot
-    tell byte-identical templates apart, so merging them moves nothing.
+    holding that origin are exempt with the claimant (``edge_kin_exempt``; the
+    claimant is exempt with itself). The merge marks an edge exempt when its
+    two templates are the same — equivalent with no edits, ends within the
+    tolerance (``MergePredicate.kin_exempt``; byte-identical before
+    2026-11-24): no split can have meant such a pair, and the extent guard
+    above still holds the group's ends together.
 
     A refused neighbour stays unclaimed: it becomes a claimant at its own turn
     or is claimed by a later one. Self-edges are ignored and of a repeated
@@ -207,8 +210,8 @@ def guarded_set_cover(
     off_5p = np.asarray(edge_off_5p, dtype=np.int64)
     off_3p = np.asarray(edge_off_3p, dtype=np.int64)
     per_edge = [edge_b, off_5p, off_3p]
-    if edge_identical is not None:
-        twin = np.asarray(edge_identical, dtype=bool)
+    if edge_kin_exempt is not None:
+        twin = np.asarray(edge_kin_exempt, dtype=bool)
         per_edge.append(twin)
     else:
         twin = np.zeros(edge_a.shape[0], dtype=bool)
@@ -312,8 +315,8 @@ def guarded_set_cover(
             claimant[nbr[free]] = r
             continue
 
-        # origin -> "every member holding it is byte-identical to the
-        # claimant", which is all a later twin of that origin needs to know.
+        # origin -> "every member holding it is exempt with the claimant",
+        # which is all a later exempt kin of that origin needs to know.
         held: dict[int, bool] = {}
         cand = nbr[free]
         if kin is not None:

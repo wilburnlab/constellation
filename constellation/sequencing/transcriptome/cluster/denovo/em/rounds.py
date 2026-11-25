@@ -212,6 +212,10 @@ class EmParams:
     #: Let templates separated by the same split merge again. Off: that is the
     #: split/merge limit cycle (51.6% of the old merge's pairs).
     merge_siblings: bool = False
+    #: Which kin the split-origin guard lets through (`graph.KIN_EXEMPT`):
+    #: "same" (2026-11-24) — equivalent with no edits — or "identical",
+    #: byte-identical only, the rule before.
+    merge_kin_exempt: str = "same"
     #: Merge only after rounds >= this (1 = every round).
     merge_from_round: int = 1
     # Round 2+ ranking (A3).
@@ -461,6 +465,7 @@ class EmParams:
             ),
             min_reads=int(self.merge_min_reads),
             merge_siblings=bool(self.merge_siblings),
+            kin_exempt=str(self.merge_kin_exempt),
         )
 
     def merges_after(self, r: int) -> bool:
@@ -1686,6 +1691,7 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log, rea
             record["graph_error"] = failure
         if graph is not None:
             record["n_still_mergeable"] = int(graph.stats.get("n_mergeable", 0))
+            record["n_kin_refused_same"] = int(graph.stats.get("n_kin_refused_same", 0))
         if graph is not None and merging:
             pred = params.merge_predicate()
             pairs = _mergeable(graph, params, exact_only=False)
@@ -1856,8 +1862,9 @@ def _merge_counts(merged: pa.Table, pairs: dict, graph: _NodeGraph) -> dict:
     ``n_still_mergeable``: pairs the predicate accepts whose two templates
     both survived — refused by a group guard, or passed over because a
     neighbour was claimed first. ``n_merged_kin``: absorbed templates that
-    share a split origin with their survivor, which only
-    ``merge_siblings`` (or byte-identity) allows.
+    share a split origin with their survivor, which only ``merge_siblings``
+    or a kin-exempt pair (the same, or byte-identical before 2026-11-24)
+    allows.
     """
     gone = merged.column("absorbed_template_id").to_numpy(zero_copy_only=False)
     kept = merged.column("survivor_template_id").to_numpy(zero_copy_only=False)
@@ -1965,6 +1972,7 @@ def _final_graph_and_merge(
         final.update(graph="failed", graph_error=failure)
         return nodes, membership, final
     final["graph"] = "ok"
+    final["n_kin_refused_same"] = int(graph.stats.get("n_kin_refused_same", 0))
 
     keep = np.arange(nodes.num_rows, dtype=np.int64)
     merged = rf.MERGED_TABLE.empty_table()
@@ -2305,13 +2313,35 @@ def _check_merge_state(rounds_dir: Path, params: EmParams, resume: bool) -> None
                     f"its parameters are committed once a round has merged. "
                     f"Restore them or choose another --output-dir."
                 )
-        if have.get("predicate") != asdict(want):
+        recorded = have.get("predicate")
+        if isinstance(recorded, dict) and "kin_exempt" not in recorded:
+            # Written before the field: only byte-identical kin were exempt.
+            recorded = {**recorded, "kin_exempt": gr.KIN_EXEMPT_BEFORE}
+        if recorded != asdict(want):
+            why = (
+                f" Its rounds let kin merge only when "
+                f"{_KIN_EXEMPT_WORDS[recorded['kin_exempt']]}; this run would "
+                f"let them merge when {_KIN_EXEMPT_WORDS[want.kin_exempt]}, "
+                f"and the templates of its later rounds descend from that "
+                f"rule."
+                if isinstance(recorded, dict)
+                and recorded.get("kin_exempt") in _KIN_EXEMPT_WORDS
+                and recorded.get("kin_exempt") != want.kin_exempt
+                else ""
+            )
             raise ValueError(
                 f"--resume would continue {run}, whose round {r} merged "
-                f"under {have.get('predicate')}, with the merge predicate "
-                f"{asdict(want)}. Restore the original merge flags or choose "
-                f"another --output-dir."
+                f"under {recorded}, with the merge predicate "
+                f"{asdict(want)}.{why} Restore the original merge flags or "
+                f"choose another --output-dir."
             )
+
+
+#: How a resume refusal names each `MergePredicate.kin_exempt` rule.
+_KIN_EXEMPT_WORDS = {
+    "same": "they are the same (equivalent, no edits)",
+    "identical": "they are byte-identical",
+}
 
 
 def _write_lineage(rd: Path, lineage: pa.Table) -> Path:

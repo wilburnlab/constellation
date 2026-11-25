@@ -570,11 +570,22 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                 f"incomplete"
             )
         kin = int(record.get("n_merged_kin", 0))
-        if kin:
+        predicate = record.get("predicate") or {}
+        # A kin merge under the guard is of a pair that is the same (or
+        # byte-identical, before 2026-11-24): a split that separated nothing.
+        # Only --merge-siblings rejoins kin that differ, which is the cycle.
+        if kin and predicate.get("merge_siblings"):
             flags.append(
                 f"r{r}: {kin:,} of {merged:,} merges rejoined templates an "
                 f"M-step split had separated (--merge-siblings) — the "
                 f"split/merge cycle measured on 2026-09-24"
+            )
+        refused_same = int(record.get("n_kin_refused_same", 0))
+        if refused_same:
+            flags.append(
+                f"r{r}: {refused_same:,} pairs that are the same (equivalent, "
+                f"no edits) were kept apart only because one split made them "
+                f"(kin exempt when byte-identical, the rule before 2026-11-24)"
             )
 
     parts = []
