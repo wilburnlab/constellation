@@ -69,6 +69,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+    COL_EXT_3P,
+    COL_EXT_5P,
     ConsensusResult,
     MemberSpec,
     frame_consensus,
@@ -144,6 +146,10 @@ class KernelInternals:
     tuple_of_member: np.ndarray | None = None
     #: The tuples that survived as nodes (indices into the tuple space).
     surviving_tuples: np.ndarray | None = None
+    #: (len(surviving_tuples),) the emitted node (haplotype id) each surviving
+    #: tuple went to. Several tuples share a node when their children were
+    #: the same (``fold_same``); otherwise one tuple per node.
+    node_of_survivor: np.ndarray | None = None
     children: list = field(default_factory=list)
 
 
@@ -315,6 +321,114 @@ def _fold_small_tuples(
     return labels, new_mass, surv
 
 
+#: ``ConsensusResult.winner`` code of a gap (``consensus._GAP``).
+_WINNER_GAP = 4
+
+
+def _frame_span(cres: ConsensusResult, lo: int, hi: int) -> tuple[int, int] | None:
+    """``[first, last + 1)`` frame columns of consensus bases ``[lo, hi)``."""
+    if hi <= lo:
+        return None
+    f = np.asarray(cres.frame_of_cons)
+    return int(f[lo]), int(f[hi - 1]) + 1
+
+
+def same_children(
+    built: list[tuple[ConsensusResult, int, int]],
+    *,
+    tol_5p: int,
+    tol_3p: int,
+    short_tol_div: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The pairs of children the template graph would call the same.
+
+    ``built[k]`` is ``(cres, lo, hi)``: child ``k`` emits
+    ``cres.consensus[lo:hi]``, and every child is on ONE column plan. Two
+    children are the same when their emitted SEQUENCES agree wherever both
+    reach, and neither reaches beyond the other at either end by more than
+    the graph's tolerance for the shorter (``min(tol, len //
+    short_tol_div)``, :func:`~.graph.effective_tolerance`): the graph's
+    ``equivalent`` relation with no edits.
+
+    The plan says only where each child starts: how many bases the earlier
+    one emits before the later one's first column is its 5' reach. From
+    there the two strings are compared base for base — not their columns,
+    since two co-optimal placements of a deletion in a homopolymer are
+    different columns and the same sequence (Codex's review, 2026-11-25).
+
+    Returns ``(a, b, off_5p, off_3p)``: the pairs, and how many bases ``b``
+    reaches beyond ``a`` at each end (negative: ``a`` beyond ``b``).
+    """
+    spans = [_frame_span(c, lo, hi) for c, lo, hi in built]
+    winners = [np.asarray(c.winner) for c, _lo, _hi in built]
+    seqs = [c.consensus[lo:hi] for c, lo, hi in built]
+
+    def bases(k: int, x: int, y: int) -> int:
+        return int((winners[k][x:y] != _WINNER_GAP).sum())
+
+    out: tuple[list, list, list, list] = ([], [], [], [])
+    for i in range(len(built)):
+        for j in range(i + 1, len(built)):
+            if spans[i] is None or spans[j] is None:
+                continue
+            (si, ei), (sj, ej) = spans[i], spans[j]
+            if min(ei, ej) <= max(si, sj):
+                continue
+            off_5p = bases(j, sj, si) if sj < si else -bases(i, si, sj)
+            # Each string from where the other begins.
+            ti, tj = seqs[i][max(0, -off_5p) :], seqs[j][max(0, off_5p) :]
+            n = min(len(ti), len(tj))
+            if n == 0 or ti[:n] != tj[:n]:
+                continue
+            off_3p = len(tj) - len(ti)
+            cap = min(len(seqs[i]), len(seqs[j])) // short_tol_div
+            if abs(off_5p) <= min(tol_5p, cap) and abs(off_3p) <= min(tol_3p, cap):
+                for col, v in zip(out, (i, j, off_5p, off_3p)):
+                    col.append(v)
+    return tuple(np.asarray(col, dtype=np.int64) for col in out)
+
+
+def _same_groups(
+    built: list[tuple[ConsensusResult, int, int]],
+    *,
+    tol_5p: int,
+    tol_3p: int,
+    short_tol_div: int,
+) -> np.ndarray:
+    """``head[k]``: the child that child ``k`` folds into (itself if none).
+
+    ``built`` is heaviest first. The heaviest child not yet in a group
+    starts one, and takes, heaviest first, each child that is the same as
+    EVERY member so far. Sameness is a tolerance and is not transitive: a
+    child lacking 20 nt at one end can be the same as two that differ inside
+    those 20 nt, and children 25 nt apart in pairs can lie 50 nt apart at
+    the ends of a chain. Holding every pair to it, each at its own length's
+    tolerance, keeps both out, and a child related to none of a group's
+    members cannot change whether they fold (Codex's review, 2026-11-25).
+    """
+    n = len(built)
+    head = np.arange(n, dtype=np.int64)
+    a, b, _, _ = same_children(
+        built, tol_5p=tol_5p, tol_3p=tol_3p, short_tol_div=short_tol_div
+    )
+    if a.size == 0:
+        return head
+    same = np.zeros((n, n), dtype=bool)
+    same[a, b] = same[b, a] = True
+    grouped = np.zeros(n, dtype=bool)
+    for k in range(n):
+        if grouped[k]:
+            continue
+        grouped[k] = True
+        members = [k]
+        for m in range(k + 1, n):
+            if not grouped[m] and same[m, members].all():
+                members.append(m)
+                grouped[m] = True
+                head[m] = k
+    return head
+
+
 def _annotate_orf(node: RefinedTemplate, min_aa_length: int) -> RefinedTemplate:
     """The longest sense ORF of the node's consensus, at or above the floor."""
     hit = best_sense_orf(node.consensus, min_aa_length=min_aa_length)
@@ -429,11 +543,43 @@ def refine_template_with_internals(
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
     node_extent: str = "union",
+    candidate_extensions: bool = False,
+    fold_same: bool = True,
+    same_tol_5p: int = 30,
+    same_tol_3p: int = 30,
+    same_short_tol_div: int = 10,
 ) -> tuple[list[RefinedTemplate], KernelInternals | None]:
     """:func:`refine_template`, also returning what it computed on the way.
 
     The one implementation of the M-step kernel: the round loop and replay
     both run it, so a replay cannot drift from the run it re-creates.
+
+    ``candidate_extensions=False`` (2026-11-24): a terminal extension column
+    of the pooled plan (``COL_EXT_5P`` / ``COL_EXT_3P``) is not a candidate.
+    Under the extent rule a read joins a template only with both ends within
+    the tolerance, so how far each read runs past the template's ends is
+    extent, the E-step's question, and never a reason to split. Yet a read
+    anchored at an end votes a gap in that end's extension block and a read
+    that runs past votes its own bases (``consensus._covers_junction``), so
+    every extension column reads as a base-versus-gap allele, and a set of
+    reads sharing an alternative start or cleavage site is a perfect clique
+    to the covariance test. On the Nov2026 run that split templates on
+    molecule ends whose children then differed only outside their median
+    extent. Interior insertion columns, at the first and last junctions
+    too, stay candidates. ``call_variants`` applies the same rule.
+
+    ``fold_same=True`` (2026-11-24): children the template graph would call
+    the same — ``equivalent`` with no edits, ends within ``same_tol_5p`` /
+    ``same_tol_3p`` (capped at a ``same_short_tol_div``-th of the shorter) —
+    are one node (:func:`same_children`). A split exists to separate
+    sequences; one whose children emit the same sequence separated nothing,
+    and left the merge's kin guard to keep them apart in every later round.
+    On the Nov2026 run 72% of round 12's splits had such children, because a
+    node keeps its reads' median extent and the columns a split used can
+    lie outside it. Folded children are pooled and their consensus built
+    once more on the pooled plan; the node's ``allele_string`` is its
+    heaviest child's. Haplotype ids stay ordered by weight, and a template
+    with no same children is emitted exactly as before.
     """
     if not members:
         return [], None
@@ -457,6 +603,11 @@ def refine_template_with_internals(
         local_window=local_window,
         boundary_tolerance=boundary_tolerance,
     )
+    eligible = (
+        None
+        if candidate_extensions
+        else ~np.isin(stats.column_kind, (COL_EXT_5P, COL_EXT_3P))
+    )
     cand = candidate_columns(
         stats,
         f_min=f_min,
@@ -465,6 +616,7 @@ def refine_template_with_internals(
         overdispersion=overdispersion,
         max_columns=max_candidate_columns,
         coverage_route=coverage_route,
+        eligible=eligible,
     )
     internals = KernelInternals(pooled=pooled, stats=stats, cand=cand)
 
@@ -476,6 +628,7 @@ def refine_template_with_internals(
         "n_coverage": cand.n_coverage,
         "n_collapsed": cand.n_collapsed,
         "n_candidates_capped": cand.n_capped,
+        "n_excluded_extension": cand.n_excluded,
         "disagreements": disagreement_stats(pooled),
     }
 
@@ -518,7 +671,7 @@ def refine_template_with_internals(
     )
     declared.sort()
 
-    def _node(hid: int, idx: np.ndarray, allele: str) -> RefinedTemplate:
+    def _child(idx: np.ndarray) -> tuple[ConsensusResult, int, int]:
         hap = [members[int(i)] for i in idx]
         # Children are built on the POOLED column plan. On their own plans each
         # would have a different column space, and a position taken from the
@@ -541,6 +694,15 @@ def refine_template_with_internals(
         )
         lo, hi = _node_span(cres, node_extent)
         cres.node_span = (lo, hi)
+        return cres, lo, hi
+
+    def _node(
+        hid: int,
+        idx: np.ndarray,
+        allele: str,
+        built: tuple[ConsensusResult, int, int] | None = None,
+    ) -> RefinedTemplate:
+        cres, lo, hi = built if built is not None else _child(idx)
         consensus = cres.consensus[lo:hi]
         internals.children.append((hid, cres, lo, hi))
         # Declared columns are PWM columns; each child reports them in its own
@@ -574,6 +736,7 @@ def refine_template_with_internals(
         )
         return _annotate_orf(node, min_aa_length)
 
+    diag["n_folded_same"] = 0
     if not assignments:
         diag["n_nodes"] = 1
         return [_node(0, np.arange(len(members)), "")], internals
@@ -595,17 +758,48 @@ def refine_template_with_internals(
         min_node_reads=min_node_reads,
         max_nodes=max_nodes,
     )
-    diag["n_nodes"] = int(surv.shape[0])
     diag["n_tuples_observed"] = int(keys.shape[0])
     internals.tuple_of_member = inverse
     internals.surviving_tuples = surv
 
     pats = _tuple_patterns(assignments, keys[surv])
     order = np.argsort(-new_mass, kind="stable")
+    # Every surviving tuple's child, heaviest first, built before any node is
+    # emitted: whether two of them are one node is decided on what they
+    # would emit.
+    idx_of = [np.flatnonzero(labels == t) for t in order.tolist()]
+    built = [_child(idx) for idx in idx_of]
+    head = np.arange(len(built), dtype=np.int64)
+    if fold_same and len(built) > 1:
+        head = _same_groups(
+            built,
+            tol_5p=same_tol_5p,
+            tol_3p=same_tol_3p,
+            short_tol_div=same_short_tol_div,
+        )
+    groups = [np.flatnonzero(head == g) for g in np.unique(head)]
+    group_mass = np.array([float(new_mass[order[k]].sum()) for k in groups])
+    # Haplotype ids by weight, as before; with nothing folded this is the
+    # tuples' own order, so a template with no same children is emitted
+    # exactly as it was.
+    by_mass = np.argsort(-group_mass, kind="stable")
+    diag["n_nodes"] = len(groups)
+    diag["n_folded_same"] = len(built) - len(groups)
+    node_of_survivor = np.empty(surv.shape[0], dtype=np.int64)
     out: list[RefinedTemplate] = []
-    for hid, t in enumerate(order.tolist()):
-        allele = "".join(_ALLELE_CHAR(int(v)) for v in pats[t])
-        out.append(_node(hid, np.flatnonzero(labels == t), allele))
+    for hid, g in enumerate(by_mass.tolist()):
+        ks = groups[g]
+        # The group's head is its heaviest child (claimed first), whose
+        # tuple names the node: the folded children differ from it only
+        # outside the span they emit, or in nothing at all.
+        allele = "".join(_ALLELE_CHAR(int(v)) for v in pats[order[ks[0]]])
+        node_of_survivor[order[ks]] = hid
+        if ks.shape[0] == 1:
+            out.append(_node(hid, idx_of[ks[0]], allele, built=built[ks[0]]))
+        else:
+            idx = np.sort(np.concatenate([idx_of[k] for k in ks.tolist()]))
+            out.append(_node(hid, idx, allele))
+    internals.node_of_survivor = node_of_survivor
     return out, internals
 
 
@@ -635,6 +829,11 @@ def refine_template(
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
     node_extent: str = "union",
+    candidate_extensions: bool = False,
+    fold_same: bool = True,
+    same_tol_5p: int = 30,
+    same_tol_3p: int = 30,
+    same_short_tol_div: int = 10,
 ) -> list[RefinedTemplate]:
     """Refine one template into its state-tuple nodes.
 
@@ -667,6 +866,11 @@ def refine_template(
         min_insertion_support=min_insertion_support,
         min_extension_support=min_extension_support,
         node_extent=node_extent,
+        candidate_extensions=candidate_extensions,
+        fold_same=fold_same,
+        same_tol_5p=same_tol_5p,
+        same_tol_3p=same_tol_3p,
+        same_short_tol_div=same_short_tol_div,
     )
     return nodes
 
@@ -678,5 +882,6 @@ __all__ = [
     "pooled_node_with_consensus",
     "refine_template",
     "refine_template_with_internals",
+    "same_children",
     "specs_from_assignments",
 ]

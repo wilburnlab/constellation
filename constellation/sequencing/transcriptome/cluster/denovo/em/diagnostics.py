@@ -570,11 +570,22 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                 f"incomplete"
             )
         kin = int(record.get("n_merged_kin", 0))
-        if kin:
+        predicate = record.get("predicate") or {}
+        # A kin merge under the guard is of a pair that is the same (or
+        # byte-identical, before 2026-11-24): a split that separated nothing.
+        # Only --merge-siblings rejoins kin that differ, which is the cycle.
+        if kin and predicate.get("merge_siblings"):
             flags.append(
                 f"r{r}: {kin:,} of {merged:,} merges rejoined templates an "
                 f"M-step split had separated (--merge-siblings) — the "
                 f"split/merge cycle measured on 2026-09-24"
+            )
+        refused_same = int(record.get("n_kin_refused_same", 0))
+        if refused_same:
+            flags.append(
+                f"r{r}: {refused_same:,} pairs that are the same (equivalent, "
+                f"no edits) were kept apart only because one split made them "
+                f"(kin exempt when byte-identical, the rule before 2026-11-24)"
             )
 
     parts = []
@@ -644,6 +655,25 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                 )
             elif final.get("merge_applied") and final.get("n_merged"):
                 rebuilt = f" Survivors were not rebuilt: {final.get('rebuild')}."
+            if final.get("same_fold") == "ok":
+                rebuilt += (
+                    f" Then {final.get('n_same_folded', 0):,} clusters that had "
+                    f"become the same as another (equivalent, no edits) were "
+                    f"folded into it, its consensus kept"
+                    + (
+                        f"; {final['n_same_refused_extent']:,} proposed folds "
+                        f"were refused because the survivor's ends refuse a read "
+                        f"of the other, and grouped again without them"
+                        if final.get("n_same_refused_extent")
+                        else ""
+                    )
+                    + f"; {final.get('n_same_remaining', 0):,} same pairs remain "
+                    f"apart (the extent rule, or a group guard — the group's "
+                    f"ends, or kin that are not the same as each other — "
+                    f"refuses joining them)."
+                )
+            elif str(final.get("same_fold", "")).startswith("failed"):
+                rebuilt += f" The closing fold did not run: {final['same_fold']}."
             if final.get("cluster_edges_source") == "final_clusters":
                 # The round's row above is the graph the merge READ; these
                 # counts are of the clusters as written.
@@ -725,8 +755,11 @@ def section_mstep(em_dir: Path) -> ReportSection:
             prev_failed, prev_dir = set(), d
             continue
         cand = sig = None
+        n_ext = n_fold = None
         failed_ids: set[int] = set()
         if t is not None and t.num_rows:
+            n_ext = _counter_sum(t, "n_excluded_extension")
+            n_fold = _counter_sum(t, "n_folded_same")
             status = t.column("status").to_numpy(zero_copy_only=False)
             ids = t.column("template_id").to_numpy(zero_copy_only=False)
             failed_ids = set(
@@ -754,6 +787,8 @@ def section_mstep(em_dir: Path) -> ReportSection:
                 in_nodes,
                 _q(cand),
                 _q(sig),
+                n_ext,
+                n_fold,
             )
         )
         if n_failed:
@@ -780,21 +815,39 @@ def section_mstep(em_dir: Path) -> ReportSection:
         return ReportSection(title="M-step", body="_no M-step record_")
     lines = [
         "| round | templates | split | failed | no members | reads assigned "
-        "| in nodes | candidates (p50/p90) | significant edges (p50/p90) |",
-        "|---:|---:|---:|---:|---:|---:|---:|---|---|",
+        "| in nodes | candidates (p50/p90) | significant edges (p50/p90) "
+        "| end columns excluded | same children folded |",
+        "|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
     ]
-    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig in rows:
+    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig, n_ext, n_fold in rows:
         lines.append(
             f"| {r} | {_fmt(n)} | {_fmt(split)} | {_fmt(failed)} | {_fmt(nomem)} "
-            f"| {_fmt(assigned)} | {_fmt(in_nodes)} | {cand} | {sig} |"
+            f"| {_fmt(assigned)} | {_fmt(in_nodes)} | {cand} | {sig} "
+            f"| {_fmt(n_ext)} | {_fmt(n_fold)} |"
         )
     body = "\n".join(lines) + (
         "\n\nCandidates and edges are over the templates that had any. "
         "*Failed* templates kept their reads in a fallback node — the pooled "
         "consensus with no split, or the template itself — rather than "
-        "leaving the round."
+        "leaving the round. *End columns excluded*: terminal extension "
+        "columns a route would have admitted, which are not candidates "
+        "(how far reads run past a template's end is extent, not a reason "
+        "to split). *Same children folded*: children of a split that the "
+        "template graph would call the same (equivalent, no edits), emitted "
+        "as one node. Both are blank for rounds recorded before the rules."
     )
     return ReportSection(title="M-step", body=body, flags=flags)
+
+
+def _counter_sum(t, name: str) -> int | None:
+    """The sum of a nullable per-template counter; ``None`` when no template
+    of the round recorded it (a round from before the counter existed)."""
+    if name not in t.column_names:
+        return None
+    col = t.column(name)
+    if col.null_count == len(col):
+        return None
+    return int(col.drop_null().to_numpy(zero_copy_only=False).sum())
 
 
 def _fmt(v) -> str:

@@ -76,6 +76,9 @@ KERNEL_COUNTERS: tuple[str, ...] = (
     "n_coverage",
     "n_collapsed",
     "n_candidates_capped",
+    # Columns a route would have admitted that the M-step ruled out as
+    # terminal extensions (2026-11-24); null in rounds recorded before.
+    "n_excluded_extension",
     "n_pairs_seen",
     "n_tested_pairs",
     "n_significant_edges",
@@ -85,6 +88,17 @@ KERNEL_COUNTERS: tuple[str, ...] = (
     "n_signatures",
     "n_tuples_observed",
     "n_nodes",
+    # Surviving tuples folded into another because their children were the
+    # same (2026-11-24); `n_nodes` counts after the fold. Null before.
+    "n_folded_same",
+)
+
+#: Counters added after runs had been recorded without them. A stored null
+#: for one of these means "not recorded", and replay does not compare it; a
+#: null for any other counter means the kernel did not get that far, which
+#: a replay must agree with.
+KERNEL_COUNTERS_ADDED: frozenset[str] = frozenset(
+    {"n_excluded_extension", "n_folded_same"}
 )
 
 MSTEP_TEMPLATE_TABLE: pa.Schema = pa.schema(
@@ -478,6 +492,7 @@ __all__ = [
     "EVIDENCE_OK",
     "EVIDENCE_VERSION",
     "KERNEL_COUNTERS",
+    "KERNEL_COUNTERS_ADDED",
     "MSTEP_DISAGREEMENT_TABLE",
     "MSTEP_TEMPLATE_TABLE",
     "STATUSES",

@@ -97,6 +97,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
     STATUSES,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
+    extent_refusals,
     rebuild_survivors,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
@@ -212,6 +213,14 @@ class EmParams:
     #: Let templates separated by the same split merge again. Off: that is the
     #: split/merge limit cycle (51.6% of the old merge's pairs).
     merge_siblings: bool = False
+    #: Which kin the split-origin guard lets through (`graph.KIN_EXEMPT`):
+    #: "same" (2026-11-24) — equivalent with no edits — or "identical",
+    #: byte-identical only, the rule before.
+    merge_kin_exempt: str = "same"
+    #: End the final stage on a sameness fold that changes no consensus
+    #: (`_fold_same_final`): after the rebuild, clusters that are now the
+    #: same are joined into the deepest, its consensus kept. On (2026-11-24).
+    final_fold_same: bool = True
     #: Merge only after rounds >= this (1 = every round).
     merge_from_round: int = 1
     # Round 2+ ranking (A3).
@@ -428,6 +437,17 @@ class EmParams:
                 "graph",
                 dataclasses.replace(self.graph, min_budget=int(self.merge_max_edits)),
             )
+        # What the M-step folds as "the same" is what the merge would treat
+        # as the same: the merge's end tolerances (the graph's unless
+        # narrowed), capped for short templates as the graph caps them.
+        pred = self.merge_predicate()
+        same = {
+            "same_tol_5p": int(pred.tol_5p),
+            "same_tol_3p": int(pred.tol_3p),
+            "same_short_tol_div": int(self.graph.short_tol_div),
+        }
+        if any(getattr(self.mstep, k) != v for k, v in same.items()):
+            object.__setattr__(self, "mstep", dataclasses.replace(self.mstep, **same))
 
     def round1_rule(self) -> str:
         """The seeder's round-1 ranking rule (`scheduler.ROUND1_RULES`).
@@ -450,6 +470,7 @@ class EmParams:
             ),
             min_reads=int(self.merge_min_reads),
             merge_siblings=bool(self.merge_siblings),
+            kin_exempt=str(self.merge_kin_exempt),
         )
 
     def merges_after(self, r: int) -> bool:
@@ -740,6 +761,12 @@ def _finish(
                 merged=(
                     pq.read_table(merged_path)
                     if final.get("merge_applied") and merged_path.exists()
+                    else None
+                ),
+                folded=(
+                    pq.read_table(final_rd / FOLDED_FINAL)
+                    if final.get("same_fold") == "ok"
+                    and (final_rd / FOLDED_FINAL).exists()
                     else None
                 ),
             ),
@@ -1675,6 +1702,7 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log, rea
             record["graph_error"] = failure
         if graph is not None:
             record["n_still_mergeable"] = int(graph.stats.get("n_mergeable", 0))
+            record["n_kin_refused_same"] = int(graph.stats.get("n_kin_refused_same", 0))
         if graph is not None and merging:
             pred = params.merge_predicate()
             pairs = _mergeable(graph, params, exact_only=False)
@@ -1702,7 +1730,7 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log, rea
     # merged is a file a re-run that merges nothing leaves behind.
     _write_table(rd / "merged.parquet", merged)
     # This round has a successor now, so it is no longer anybody's final one.
-    for stale in ("final.json", "merged_final.parquet", FINAL_PARAMS):
+    for stale in ("final.json", "merged_final.parquet", FOLDED_FINAL, FINAL_PARAMS):
         (rd / stale).unlink(missing_ok=True)
     shutil.rmtree(rd / _FINAL_GRAPH, ignore_errors=True)
     _write_json(rd / "refine.json", record)
@@ -1845,8 +1873,9 @@ def _merge_counts(merged: pa.Table, pairs: dict, graph: _NodeGraph) -> dict:
     ``n_still_mergeable``: pairs the predicate accepts whose two templates
     both survived — refused by a group guard, or passed over because a
     neighbour was claimed first. ``n_merged_kin``: absorbed templates that
-    share a split origin with their survivor, which only
-    ``merge_siblings`` (or byte-identity) allows.
+    share a split origin with their survivor, which only ``merge_siblings``
+    or a kin-exempt pair (the same, or byte-identical before 2026-11-24)
+    allows.
     """
     gone = merged.column("absorbed_template_id").to_numpy(zero_copy_only=False)
     kept = merged.column("survivor_template_id").to_numpy(zero_copy_only=False)
@@ -1938,8 +1967,10 @@ def _final_graph_and_merge(
         "n_merged": 0,
         "n_nodes": int(nodes.num_rows),
     }
-    # Whatever an earlier invocation related here, it was not these clusters.
+    # Whatever an earlier invocation related or folded here, it was not
+    # these clusters.
     shutil.rmtree(rd / _FINAL_GRAPH, ignore_errors=True)
+    (rd / FOLDED_FINAL).unlink(missing_ok=True)
     if params.template_graph == "off":
         shutil.rmtree(rd / "graph", ignore_errors=True)
         return nodes, membership, final
@@ -1954,6 +1985,7 @@ def _final_graph_and_merge(
         final.update(graph="failed", graph_error=failure)
         return nodes, membership, final
     final["graph"] = "ok"
+    final["n_kin_refused_same"] = int(graph.stats.get("n_kin_refused_same", 0))
 
     keep = np.arange(nodes.num_rows, dtype=np.int64)
     merged = rf.MERGED_TABLE.empty_table()
@@ -2074,9 +2106,218 @@ def _final_graph_and_merge(
                         "origin": gr.merged_origins(graph.origin, survivor, keep),
                     }
     _write_table(rd / "merged_final.parquet", merged)
+    if final.get("export_graph") is not None:
+        folded = rf.MERGED_TABLE.empty_table()
+        if params.final_fold_same:
+            nodes, membership, keep, folded = _fold_same_final(
+                rd,
+                nodes,
+                membership,
+                keep,
+                final,
+                params,
+                log or (lambda _m: None),
+                corpus_path=corpus_path,
+                round_index=r + 1,
+            )
+        else:
+            final["same_fold"] = "off"
+        _write_table(rd / FOLDED_FINAL, folded)
     final["edges_path"] = graph.path
     final["keep_rows"] = keep
     return nodes, membership, final
+
+
+#: The final stage's closing fold (`_fold_same_final`): clusters folded into
+#: another because, after the rebuild, the two were the same. A
+#: `MERGED_TABLE`, ids the round's node ids, as `merged_final.parquet`.
+FOLDED_FINAL = "folded_final.parquet"
+
+
+def _select_same_folds(
+    n: int,
+    pairs: dict,
+    n_reads: np.ndarray,
+    seq_len: np.ndarray,
+    *,
+    tol_5p: int,
+    tol_3p: int,
+    origin: np.ndarray | None,
+    refuses,
+) -> tuple[np.ndarray, int]:
+    """The closing fold's groups, with read-level eligibility settled first.
+
+    ``pairs`` are same pairs by row (``mergeable_pairs``); ``refuses(absorbed,
+    into)`` answers, per pair of rows, whether ``into``'s ends refuse some
+    read of ``absorbed``. The pairs are grouped as the merge groups them
+    (deepest first, the group's ends within the tolerance, kin by the
+    predicate's rule); any absorption refused for extent removes its edge
+    and the grouping is made again, until none is refused. Removing a member
+    after the grouping instead would leave the neighbours it had crowded out
+    of the group's end allowance apart for no reason (Codex's review,
+    2026-11-25). Each (absorbed, survivor) pair is checked once; every pass
+    removes an edge, so the loop ends. Returns ``(survivor, n_refused)``.
+    """
+    a = np.asarray(pairs["src_row"], dtype=np.int64)
+    b = np.asarray(pairs["dst_row"], dtype=np.int64)
+    rows = np.arange(n, dtype=np.int64)
+    allowed = np.ones(a.shape[0], dtype=bool)
+    verdict: dict[tuple[int, int], bool] = {}
+    while True:
+        survivor = rf.select_merges(
+            n,
+            a[allowed],
+            b[allowed],
+            np.asarray(pairs["off_5p"], dtype=np.int64)[allowed],
+            np.asarray(pairs["off_3p"], dtype=np.int64)[allowed],
+            n_reads,
+            seq_len,
+            tol_5p=tol_5p,
+            tol_3p=tol_3p,
+            kin_exempt=np.asarray(pairs["kin_exempt"], dtype=bool)[allowed],
+            origin=origin,
+            prefer="support",
+        )
+        joined = [(int(x), int(survivor[x])) for x in np.flatnonzero(survivor != rows)]
+        todo = [p for p in joined if p not in verdict]
+        if todo:
+            got = refuses(
+                np.array([p[0] for p in todo], dtype=np.int64),
+                np.array([p[1] for p in todo], dtype=np.int64),
+            )
+            verdict.update(zip(todo, np.asarray(got, dtype=bool).tolist()))
+        bad = [min(p) * n + max(p) for p in joined if verdict[p]]
+        if not bad:
+            return survivor, int(sum(verdict.values()))
+        allowed &= ~np.isin(
+            np.minimum(a, b) * n + np.maximum(a, b), np.asarray(bad, dtype=np.int64)
+        )
+
+
+def _fold_same_final(
+    rd: Path,
+    nodes: pa.Table,
+    membership: pa.Table,
+    keep: np.ndarray,
+    final: dict,
+    params: EmParams,
+    log,
+    *,
+    corpus_path,
+    round_index: int,
+) -> tuple[pa.Table, pa.Table, np.ndarray, pa.Table]:
+    """The final stage's last step: fold the clusters that are now the same.
+
+    The final merge is one pass, and the rebuild after it re-makes each
+    survivor's consensus from its group's reads, which moves its ends to
+    the pooled reads' medians and can flip a majority base. So clusters can
+    be the same after the rebuild that were not before it, and pairs the one
+    star pass left apart can be byte-identical by then: on Nov2026 em_261120
+    that was 244 of the output's 467 twin pairs. Repeating merge and rebuild
+    would be a third copy of the M-step's consensus step, each pass able to
+    make new same pairs. The last step is instead a sameness check that
+    changes no consensus, so one pass is final.
+
+    The clusters are related as written here (the graph the cluster-edge
+    export needs anyway, built before the outputs rather than after). Their
+    same pairs — ``equivalent``, no edits, within the predicate's
+    tolerances, kin exempt by its rule — are grouped as the merge groups
+    them (the deepest first, the group's ends within the tolerance). An
+    absorbed cluster joins only if the survivor's consensus refuses none of
+    its reads for extent (:func:`~.rebuild.extent_refusals`); otherwise it
+    stays apart, whole. The survivor keeps its consensus, ends and ORF, and
+    holds the absorbed reads. ``folded_final.parquet`` records each fold;
+    ``final.json`` its counts. Returns ``(nodes, membership, keep, folded)``
+    with ``keep`` the merge input's rows that are still clusters.
+    """
+    export = final["export_graph"]
+    try:
+        edges_path = _relate_final_clusters(rd, final, params, log)
+    except Exception as exc:  # noqa: BLE001 — the clusters stand without it
+        final["same_fold"] = f"failed: {type(exc).__name__}: {exc}"[:500]
+        log(f"final output: relating the clusters failed ({final['same_fold']})")
+        return nodes, membership, keep, rf.MERGED_TABLE.empty_table()
+    pred = params.merge_predicate()
+    # Exact and mergeable: the stored verdict is the run's predicate, so this
+    # reads only rows that can fold, not every exact `contained` edge.
+    pairs = gr.mergeable_pairs(
+        pq.read_table(
+            edges_path, filters=[("n_edits", "==", 0), ("mergeable", "==", True)]
+        ),
+        pred,
+        exact_only=True,
+    )
+    n = nodes.num_rows
+    rows = np.arange(n, dtype=np.int64)
+    n_reads = nodes.column("n_reads").to_numpy(zero_copy_only=False).astype(np.int64)
+    seq_len = pc.utf8_length(nodes.column("consensus")).to_numpy(zero_copy_only=False)
+
+    def refuses(absorbed: np.ndarray, into: np.ndarray) -> np.ndarray:
+        return extent_refusals(
+            nodes,
+            membership,
+            absorbed,
+            into,
+            str(corpus_path),
+            identity_floor=params.p_floor,
+            quality_scale=params.p_floor_quality_scale,
+            end_tolerance=params.end_tolerance,
+            threads=params.threads,
+        )
+
+    survivor, n_refused = _select_same_folds(
+        n,
+        pairs,
+        n_reads,
+        seq_len,
+        tol_5p=pred.tol_5p,
+        tol_3p=pred.tol_3p,
+        origin=None if pred.merge_siblings else export["origin"],
+        refuses=refuses,
+    )
+    folded = rf.merged_table(
+        export["ids"],
+        survivor,
+        pairs["src_row"],
+        pairs["dst_row"],
+        pairs["off_5p"],
+        pairs["off_3p"],
+        n_reads,
+        round_index=round_index,
+    )
+    nodes, membership, n_folded = rf.apply_survivors(nodes, membership, survivor)
+    kept = np.flatnonzero(survivor == rows)
+    still = np.isin(pairs["src_row"], kept) & np.isin(pairs["dst_row"], kept)
+    rebuilt = np.asarray(final.get("rebuilt_rows", []), dtype=np.int64)
+    final["rebuilt_rows"] = np.searchsorted(kept, rebuilt[np.isin(rebuilt, kept)])
+    final["export_graph"] = {
+        "sequences": nodes.column("consensus"),
+        "ids": export["ids"][kept],
+        "n_reads": nodes.column("n_reads").to_numpy(zero_copy_only=False).astype(np.int64),
+        "origin": gr.merged_origins(export["origin"], survivor, kept),
+    }
+    # The edges of the clusters as related, and which of their rows are
+    # still clusters: the export reads these instead of relating again.
+    final["final_edges_path"] = edges_path
+    final["final_edge_rows"] = kept
+    final.update(
+        same_fold="ok",
+        n_same_pairs=int(pairs["src_row"].shape[0]),
+        n_same_folded=int(n_folded),
+        n_same_refused_extent=int(n_refused),
+        n_same_remaining=int(still.sum()),
+    )
+    if n_folded:
+        log(
+            f"final output: folded {n_folded:,} cluster(s) into another they "
+            f"had become the same as"
+            + (
+                f" ({int(n_refused):,} pair(s) refused for their reads' extent)"
+                if n_refused
+                else ""
+            )
+        )
+    return nodes, membership, np.asarray(keep, dtype=np.int64)[kept], folded
 
 
 #: Where the final clusters are related again, when the final merge rebuilt
@@ -2154,7 +2395,16 @@ def _cluster_edges(
     try:
         edges_path, keep_rows = final["edges_path"], final["keep_rows"]
         final["cluster_edges_source"] = "round_graph"
-        if final.get("export_graph") is not None:
+        origin = predicate = None
+        if final.get("final_edges_path") is not None:
+            # Related already, before the closing fold; the fold changed
+            # which rows are clusters, what they hold and whose kin they are.
+            final["cluster_edges_source"] = "final_clusters"
+            edges_path = final["final_edges_path"]
+            keep_rows = final["final_edge_rows"]
+            origin = final["export_graph"]["origin"]
+            predicate = params.merge_predicate() if params is not None else None
+        elif final.get("export_graph") is not None:
             if rd is None or params is None:
                 raise ValueError(
                     "the final merge rebuilt consensus sequences, so the "
@@ -2165,7 +2415,12 @@ def _cluster_edges(
             edges_path = _relate_final_clusters(rd, final, params, log)
             keep_rows = np.arange(clusters.num_rows, dtype=np.int64)
         paths["cluster_edges"], counts = write_cluster_edges(
-            output_dir, edges_path, keep_rows, clusters
+            output_dir,
+            edges_path,
+            keep_rows,
+            clusters,
+            cluster_origin=origin if predicate is not None else None,
+            predicate=predicate,
         )
         return counts
     except Exception as exc:  # noqa: BLE001 — a report never sinks a run
@@ -2189,7 +2444,15 @@ def _write_final_record(rd: Path, final: dict, n_clusters: int, counts: dict) ->
     record = {
         k: v
         for k, v in final.items()
-        if k not in ("edges_path", "keep_rows", "export_graph", "rebuilt_rows")
+        if k
+        not in (
+            "edges_path",
+            "keep_rows",
+            "export_graph",
+            "rebuilt_rows",
+            "final_edges_path",
+            "final_edge_rows",
+        )
     }
     record["n_clusters"] = int(n_clusters)
     record.update({k: int(v) for k, v in counts.items()})
@@ -2294,13 +2557,35 @@ def _check_merge_state(rounds_dir: Path, params: EmParams, resume: bool) -> None
                     f"its parameters are committed once a round has merged. "
                     f"Restore them or choose another --output-dir."
                 )
-        if have.get("predicate") != asdict(want):
+        recorded = have.get("predicate")
+        if isinstance(recorded, dict) and "kin_exempt" not in recorded:
+            # Written before the field: only byte-identical kin were exempt.
+            recorded = {**recorded, "kin_exempt": gr.KIN_EXEMPT_BEFORE}
+        if recorded != asdict(want):
+            why = (
+                f" Its rounds let kin merge only when "
+                f"{_KIN_EXEMPT_WORDS[recorded['kin_exempt']]}; this run would "
+                f"let them merge when {_KIN_EXEMPT_WORDS[want.kin_exempt]}, "
+                f"and the templates of its later rounds descend from that "
+                f"rule."
+                if isinstance(recorded, dict)
+                and recorded.get("kin_exempt") in _KIN_EXEMPT_WORDS
+                and recorded.get("kin_exempt") != want.kin_exempt
+                else ""
+            )
             raise ValueError(
                 f"--resume would continue {run}, whose round {r} merged "
-                f"under {have.get('predicate')}, with the merge predicate "
-                f"{asdict(want)}. Restore the original merge flags or choose "
-                f"another --output-dir."
+                f"under {recorded}, with the merge predicate "
+                f"{asdict(want)}.{why} Restore the original merge flags or "
+                f"choose another --output-dir."
             )
+
+
+#: How a resume refusal names each `MergePredicate.kin_exempt` rule.
+_KIN_EXEMPT_WORDS = {
+    "same": "they are the same (equivalent, no edits)",
+    "identical": "they are byte-identical",
+}
 
 
 def _write_lineage(rd: Path, lineage: pa.Table) -> Path:

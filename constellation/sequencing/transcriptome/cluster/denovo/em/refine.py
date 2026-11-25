@@ -377,7 +377,7 @@ def select_merges(
     *,
     tol_5p: int,
     tol_3p: int,
-    identical: np.ndarray | None = None,
+    kin_exempt: np.ndarray | None = None,
     origin: np.ndarray | None = None,
     prefer: Prefer = "support",
 ) -> np.ndarray:
@@ -412,7 +412,7 @@ def select_merges(
         tol_5p=int(tol_5p),
         tol_3p=int(tol_3p),
         origin=origin,
-        edge_identical=None if identical is None else np.asarray(identical, bool)[ok],
+        edge_kin_exempt=None if kin_exempt is None else np.asarray(kin_exempt, bool)[ok],
     )
     return res.centroid_uniq[res.cluster_of].astype(np.int64)
 
@@ -542,7 +542,7 @@ def apply_merge(
         seq_len,
         tol_5p=tol_5p,
         tol_3p=tol_3p,
-        identical=pairs.get("identical"),
+        kin_exempt=pairs.get("kin_exempt"),
         origin=kin,
         prefer=prefer,
     )
@@ -655,7 +655,7 @@ def merge_nodes(
         seq_len,
         tol_5p=tol_5p,
         tol_3p=tol_3p,
-        identical=pairs.get("identical"),
+        kin_exempt=pairs.get("kin_exempt"),
         origin=origin,
         prefer=prefer,
     )

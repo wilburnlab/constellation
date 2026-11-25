@@ -526,3 +526,310 @@ def test_a_run_recorded_before_node_extent_replays_as_union() -> None:
     assert _mstep_params(old, MStepParams).node_extent == "union"
     assert MStepParams().node_extent == "median"
     assert _mstep_params(dataclasses.asdict(MStepParams()), MStepParams).node_extent == "median"
+
+
+# ── molecule ends are extent, not a reason to split (2026-11-24) ──────
+
+
+def _at(frame: str, read: str, start: int, member_id: int, cigar: str | None = None):
+    """``read`` aligned to all of ``frame`` from read offset ``start``: the
+    read bases before ``start`` and after the frame are its 5'/3' flanks,
+    which is how the E-step's alignments reach the PWM."""
+    return MemberSpec(read, 1.0, cigar or f"{len(frame)}M", False, 0, start, member_id)
+
+
+def _ragged_ends(rng, frame: str, n: int, first_id: int = 0, body: str | None = None):
+    """``n`` reads of ``body`` (default ``frame``) in four end classes: a
+    quarter as the frame, a quarter running 3 nt past its 3' end, a quarter
+    12 nt past its 5' end, a quarter past both. The extent rule admits all of
+    them to one template; only the flanks differ."""
+    body = body or frame
+    ext5, ext3 = _rand(rng, 12), "GAT"
+    reads = []
+    for i in range(n):
+        five, three = (i % 4) in (2, 3), (i % 4) in (1, 3)
+        seq = (ext5 if five else "") + body + (ext3 if three else "")
+        reads.append(_at(frame, seq, 12 if five else 0, first_id + i))
+    return reads
+
+
+def test_molecule_end_variation_alone_does_not_split():
+    """The Nov2026 twins (Tubb4b 1378/1379): a template split by which reads
+    end one cleavage site later and which carry an alternative start. Every
+    one of those columns is a terminal extension; ruled out, the template is
+    one node. Admitted, as before, they split it."""
+    rng = np.random.default_rng(83)
+    frame = _rand(rng, 600)
+    members = _ragged_ends(rng, frame, 100)
+
+    nodes = refine_template(frame, members)
+    assert len(nodes) == 1
+    assert nodes[0].n_reads == 100
+    assert nodes[0].stats["n_excluded_extension"] > 0
+
+    before = refine_template(frame, members, candidate_extensions=True, fold_same=False)
+    assert len(before) > 1
+    assert before[0].stats["n_excluded_extension"] == 0
+
+
+def test_an_interior_variant_near_an_end_still_splits():
+    """The Prm2 C/C pair: two linked substitutions 40 and 45 nt from the 5'
+    end in a minority, among reads whose ends vary. Only the interior pair
+    splits the template, and the minority node carries it."""
+    rng = np.random.default_rng(89)
+    frame = _rand(rng, 600)
+    alt = list(frame)
+    for p in (40, 45):
+        alt[p] = "A" if frame[p] != "A" else "C"
+    alt = "".join(alt)
+    members = _ragged_ends(rng, frame, 70) + _ragged_ends(
+        rng, frame, 30, first_id=70, body=alt
+    )
+
+    nodes = refine_template(frame, members)
+    assert sorted(n.n_reads for n in nodes) == [30, 70]
+    minor = min(nodes, key=lambda n: n.n_reads)
+    assert alt[30:60] in minor.consensus
+    assert frame[30:60] not in minor.consensus
+
+
+def test_an_insertion_at_the_first_interior_junction_is_still_a_candidate():
+    """Only the blocks before the template's first base and after its last are
+    extent. An insertion between its first two bases is an interior column
+    (``COL_INSERTED``) and stays a candidate."""
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+        COL_INSERTED,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        refine_template_with_internals,
+    )
+
+    rng = np.random.default_rng(97)
+    frame = _rand(rng, 600)
+    ins = "T" if frame[1] != "T" else "A"
+    sub = "A" if frame[300] != "A" else "C"
+    carrier = frame[0] + ins + frame[1:300] + sub + frame[301:]
+    members = [_at(frame, frame, 0, i) for i in range(70)] + [
+        _at(frame, carrier, 0, 70 + i, cigar="1M1I599M") for i in range(30)
+    ]
+    nodes, internals = refine_template_with_internals(frame, members)
+    kind = internals.pooled.column_kind
+    inserted = [c for c in internals.cand.columns.tolist() if kind[c] == COL_INSERTED]
+    assert inserted, "the first-junction insertion column is a candidate"
+    assert sorted(n.n_reads for n in nodes) == [30, 70]
+
+
+def test_a_run_recorded_before_the_extension_rule_replays_with_extensions() -> None:
+    import dataclasses
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import MStepParams
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import _mstep_params
+
+    old = {
+        k: v
+        for k, v in dataclasses.asdict(MStepParams()).items()
+        if k != "candidate_extensions"
+    }
+    assert _mstep_params(old, MStepParams).candidate_extensions is True
+    assert MStepParams().candidate_extensions is False
+    assert MStepParams().kernel_kwargs()["candidate_extensions"] is False
+
+
+# ── a split never emits two children the graph would call the same ────
+
+
+def test_children_that_are_the_same_are_one_node():
+    """With extension columns admitted (the rule before), the ragged-ends
+    template splits on its ends — and every child emits the same sequence
+    over the span it shares with the others, its ends within 12 nt. The
+    graph would call them `equivalent` with no edits; they are one node."""
+    rng = np.random.default_rng(101)
+    frame = _rand(rng, 600)
+    members = _ragged_ends(rng, frame, 100)
+
+    apart = refine_template(frame, members, candidate_extensions=True, fold_same=False)
+    assert len(apart) > 1
+    folded = refine_template(frame, members, candidate_extensions=True)
+    assert len(folded) == 1
+    assert folded[0].n_reads == 100
+    assert folded[0].stats["n_folded_same"] == len(apart) - 1
+    assert folded[0].stats["n_nodes"] == 1
+    # The same under the median extent the loop runs with.
+    assert len(
+        refine_template(frame, members, candidate_extensions=True, node_extent="median")
+    ) == 1
+
+
+def test_same_children_fold_and_a_real_variant_stays_apart():
+    """Ends split three ways and an interior pair a fourth: the children that
+    differ only at their ends are one node, the carriers of the pair another."""
+    rng = np.random.default_rng(103)
+    frame = _rand(rng, 600)
+    alt = list(frame)
+    for p in (300, 305):
+        alt[p] = "A" if frame[p] != "A" else "C"
+    alt = "".join(alt)
+    members = _ragged_ends(rng, frame, 70) + _ragged_ends(
+        rng, frame, 30, first_id=70, body=alt
+    )
+    nodes = refine_template(frame, members, candidate_extensions=True)
+    assert sorted(n.n_reads for n in nodes) == [30, 70]
+    minor = min(nodes, key=lambda n: n.n_reads)
+    assert alt[290:320] in minor.consensus
+    assert [n.haplotype_id for n in nodes] == [0, 1]
+    assert nodes[0].n_reads == 70, "ids follow weight after the fold"
+
+
+def test_a_template_with_no_same_children_is_emitted_as_before():
+    """The fold is inert where nothing is the same: node for node, read for
+    read, the emission is the one before the rule."""
+    rng = np.random.default_rng(89)
+    frame = _rand(rng, 600)
+    alt = list(frame)
+    for p in (40, 45):
+        alt[p] = "A" if frame[p] != "A" else "C"
+    alt = "".join(alt)
+    members = [_at(frame, frame, 0, i) for i in range(70)] + [
+        _at(frame, alt, 0, 70 + i) for i in range(30)
+    ]
+    on = refine_template(frame, members)
+    off = refine_template(frame, members, fold_same=False)
+    assert [(n.haplotype_id, n.consensus, n.member_ids.tolist()) for n in on] == [
+        (n.haplotype_id, n.consensus, n.member_ids.tolist()) for n in off
+    ]
+    assert on[0].stats["n_folded_same"] == 0
+
+
+class _Child:
+    """The fields the sameness test reads, on a plan with no gaps."""
+
+    def __init__(self, codes: np.ndarray):
+        self.winner = codes
+        self.frame_of_cons = np.arange(codes.shape[0])
+        self.consensus = "".join("ACGT"[int(c)] for c in codes)
+
+
+def test_sameness_is_a_tolerance_and_does_not_chain():
+    """Children starting 0, 25 and 50 nt in: each neighbouring pair is within
+    the 30-nt tolerance, the outer pair is not. Grouped as the merge groups
+    (the heaviest claiming, the group's ends held to the tolerance), the
+    middle child takes one neighbour and the other stays apart, never all
+    three — which union-find over the pairs would give."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        _same_groups,
+        same_children,
+    )
+
+    rng = np.random.default_rng(7)
+    codes = rng.integers(0, 4, 600).astype(np.int8)
+    plan = _Child(codes)
+    mid, early, late = (plan, 25, 600), (plan, 0, 600), (plan, 50, 600)
+    built = [mid, early, late]  # heaviest first
+    a, b, off_5p, _ = same_children(built, tol_5p=30, tol_3p=30, short_tol_div=10)
+    assert sorted(zip(a.tolist(), b.tolist())) == [(0, 1), (0, 2)]
+    assert dict(zip(b.tolist(), off_5p.tolist())) == {1: 25, 2: -25}
+    head = _same_groups(built, tol_5p=30, tol_3p=30, short_tol_div=10)
+    assert head.tolist() == [0, 0, 2]
+
+    # One base different inside the shared span: not the same.
+    other = codes.copy()
+    other[300] = (other[300] + 1) % 4
+    a, *_ = same_children(
+        [(plan, 0, 600), (_Child(other), 0, 600)], tol_5p=30, tol_3p=30, short_tol_div=10
+    )
+    assert a.size == 0
+    # A short template's tolerance is a tenth of it, as in the graph.
+    a, *_ = same_children(
+        [(plan, 0, 200), (plan, 25, 200)], tol_5p=30, tol_3p=30, short_tol_div=10
+    )
+    assert a.size == 0
+
+
+def test_a_run_recorded_before_the_fold_replays_without_it() -> None:
+    import dataclasses
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import MStepParams
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import _mstep_params
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import EmParams
+
+    old = {
+        k: v for k, v in dataclasses.asdict(MStepParams()).items()
+        if k not in ("fold_same", "same_tol_5p", "same_tol_3p", "same_short_tol_div")
+    }
+    assert _mstep_params(old, MStepParams).fold_same is False
+    assert MStepParams().fold_same is True
+    # The M-step judges sameness at the merge's tolerance.
+    assert EmParams().mstep.same_tol_5p == 30
+    narrowed = EmParams(merge_tol_5p=10)
+    assert (narrowed.mstep.same_tol_5p, narrowed.mstep.same_tol_3p) == (10, 30)
+    assert EmParams(end_tolerance=20).mstep.same_tol_3p == 20
+
+
+def test_children_with_one_sequence_in_different_columns_are_the_same():
+    """Every read is the same molecule, one A short of a 5-A run. Seventy
+    alignments put the deletion at the run's first column and thirty at its
+    last: two co-optimal placements, two anticorrelated columns, a split —
+    and two children that emit the same sequence. Sameness is decided on the
+    sequence, not the columns (Codex's review, 2026-11-25)."""
+    rng = np.random.default_rng(107)
+    left, right = _flank(rng, 300), _flank(rng, 295)
+    left = left[:-1] + ("C" if left[-1] == "A" else left[-1])
+    right = ("G" if right[0] == "A" else right[0]) + right[1:]
+    frame = left + "AAAAA" + right
+    read = left + "AAAA" + right
+    first = f"300M1D{len(frame) - 301}M"
+    last = f"304M1D{len(frame) - 305}M"
+    members = [_at(frame, read, 0, i, cigar=first) for i in range(70)] + [
+        _at(frame, read, 0, 70 + i, cigar=last) for i in range(30)
+    ]
+    apart = refine_template(frame, members, fold_same=False)
+    assert [n.n_reads for n in apart] == [70, 30]
+    assert apart[0].consensus == apart[1].consensus == read
+    folded = refine_template(frame, members)
+    assert [n.n_reads for n in folded] == [100]
+    assert folded[0].consensus == read
+    assert folded[0].stats["n_folded_same"] == 1
+
+
+def test_a_child_related_to_none_does_not_change_whether_others_fold():
+    """300 and 273 nt, 27 apart: the same, at the shorter's tolerance (27).
+    A 268-nt child related to neither must not lower it."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        _same_groups,
+    )
+
+    rng = np.random.default_rng(11)
+    plan = _Child(rng.integers(0, 4, 300).astype(np.int8))
+    unrelated = _Child(rng.integers(0, 4, 268).astype(np.int8))
+    kw = dict(tol_5p=30, tol_3p=30, short_tol_div=10)
+    alone = [(plan, 0, 300), (plan, 27, 300)]
+    assert _same_groups(alone, **kw).tolist() == [0, 0]
+    for built in (alone + [(unrelated, 0, 268)], [(unrelated, 0, 268)] + alone):
+        head = _same_groups(built, **kw).tolist()
+        pair = [i for i, b in enumerate(built) if b[0] is plan]
+        lone = next(i for i, b in enumerate(built) if b[0] is unrelated)
+        assert head[pair[0]] == head[pair[1]] == pair[0]
+        assert head[lone] == lone
+
+
+def test_a_group_holds_every_pair_to_sameness():
+    """A child lacking the first 20 nt is the same as two full-length ones
+    that differ inside those 20 nt; they are not the same as each other. It
+    takes one, never both."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        _same_groups,
+    )
+
+    rng = np.random.default_rng(13)
+    codes = rng.integers(0, 4, 900).astype(np.int8)
+    other = codes.copy()
+    other[[5, 10]] = (other[[5, 10]] + 1) % 4
+    short, full, variant = (_Child(codes), 20, 900), (_Child(codes), 0, 900), (
+        _Child(other),
+        0,
+        900,
+    )
+    head = _same_groups(
+        [short, full, variant], tol_5p=30, tol_3p=30, short_tol_div=10
+    ).tolist()
+    assert head == [0, 0, 2]

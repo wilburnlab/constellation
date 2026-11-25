@@ -228,32 +228,16 @@ def _source(replay) -> _Source:
         src.verified = bool(replay.verified)
         src.mismatch = list(replay.mismatch)
         src.warnings = list(dict.fromkeys(list(replay.warnings) + src.warnings))
-        extra = replay.absorbed_read_row
-        if replay.kind == "merged" and extra is not None and extra.size:
-            n = int(extra.size)
-            src.read_row = np.concatenate([src.read_row, extra.astype(np.int64)])
-            src.node_of_read = np.concatenate(
-                [src.node_of_read, np.full(n, int(replay.haplotype_id), np.int64)]
+        if replay.kind == "merged":
+            _list_unaligned(
+                src,
+                replay.absorbed_read_row,
+                replay.absorbed_node_template_id,
+                replay.absorbed_read_ids,
+                replay.absorbed_quality,
+                int(replay.haplotype_id),
             )
-            src.absorbed_from = np.concatenate(
-                [src.absorbed_from, np.asarray(replay.absorbed_node_template_id, np.int64)]
-            )
-            src.read_ids = pa.concat_arrays(
-                [
-                    pa.array(src.read_ids).cast(pa.string()),
-                    pa.array(replay.absorbed_read_ids).cast(pa.string()),
-                ]
-            )
-            src.quality = np.concatenate(
-                [src.quality, np.asarray(replay.absorbed_quality, np.float64)]
-            )
-            if src.display is not None:
-                pad = pa.table(
-                    {f.name: pa.nulls(n, f.type) for f in src.display.schema},
-                    schema=src.display.schema,
-                )
-                src.display = pa.concat_tables([src.display, pad])
-        return src
+        return _with_folded(src, replay)
     if isinstance(replay, ClusterReplay) and replay.kind == "rebuilt":
         from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
             _support_span,
@@ -275,7 +259,7 @@ def _source(replay) -> _Source:
             if replay.pool_node_template_id is not None
             else np.full(pool.size, int(replay.node_template_id), np.int64)
         )
-        return _Source(
+        src = _Source(
             pooled=replay.pooled,
             children=[(hid, replay.pooled, lo, hi)],
             read_row=pool,
@@ -295,7 +279,56 @@ def _source(replay) -> _Source:
             ),
             mismatch=list(replay.mismatch),
         )
+        return _with_folded(src, replay)
     raise TypeError(f"not a replay: {type(replay).__name__}")
+
+
+def _list_unaligned(src, rows, node_ids, read_ids, quality, hid: int) -> None:
+    """Append reads that are members of the cluster but were never aligned
+    to its frame: no alignment, no display row, their node in
+    ``absorbed_from``."""
+    if rows is None or not np.asarray(rows).size:
+        return
+    rows = np.asarray(rows, dtype=np.int64)
+    n = int(rows.size)
+    src.read_row = np.concatenate([src.read_row, rows])
+    src.node_of_read = np.concatenate([src.node_of_read, np.full(n, hid, np.int64)])
+    src.absorbed_from = np.concatenate(
+        [src.absorbed_from, np.asarray(node_ids, np.int64)]
+    )
+    src.read_ids = pa.concat_arrays(
+        [
+            pa.array(src.read_ids).cast(pa.string()),
+            pa.array(read_ids).cast(pa.string()),
+        ]
+    )
+    src.quality = np.concatenate([src.quality, np.asarray(quality, np.float64)])
+    if src.display is not None:
+        pad = pa.table(
+            {f.name: pa.nulls(n, f.type) for f in src.display.schema},
+            schema=src.display.schema,
+        )
+        src.display = pa.concat_tables([src.display, pad])
+
+
+def _with_folded(src, replay):
+    """The reads the closing fold joined to the cluster, listed beside it."""
+    if isinstance(replay, ClusterReplay) and replay.folded_read_row is not None:
+        _list_unaligned(
+            src,
+            replay.folded_read_row,
+            replay.folded_node_template_id,
+            replay.folded_read_ids,
+            replay.folded_quality,
+            int(replay.haplotype_id),
+        )
+        src.warnings = list(src.warnings) + [
+            f"{int(np.asarray(replay.folded_read_row).size)} reads of clusters "
+            "that had become the same as this one after the final rebuild were "
+            "folded into it; they are members, listed without an alignment to "
+            "its frame"
+        ]
+    return src
 
 
 def support_tables(replay, *, node: int | None = None, space: str = "consensus"):
@@ -695,6 +728,12 @@ def replay_summary(replay) -> dict:
             if replay.pool_node_template_id is not None
             else 0,
         )
+    folded = (
+        replay.folded_read_row
+        if isinstance(replay, ClusterReplay) and replay.folded_read_row is not None
+        else None
+    )
+    out["n_folded_reads"] = int(np.asarray(folded).size) if folded is not None else 0
     return out
 
 

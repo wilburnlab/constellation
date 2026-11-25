@@ -1229,32 +1229,34 @@ def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatc
 
 
 @needs_minimap2
-def test_split_siblings_are_not_merged_unless_asked(tmp_path, monkeypatch):
-    """Two nodes of one parent that differ only in extent are what an M-step
-    split on a start mode leaves behind. Merging them back is the limit
-    cycle, so it takes --merge-siblings."""
+def test_split_siblings_that_differ_only_in_extent_are_merged(tmp_path, monkeypatch):
+    """Two nodes of one parent that differ only in extent (12 nt at the 5'
+    end, no edits) are the same: a split that left them separated nothing
+    (2026-11-24). The kin guard lets them merge. Under the rule before —
+    byte-identical kin only — that took --merge-siblings, and the refusal is
+    counted as `n_kin_refused_same`."""
     corpus = _panel(tmp_path)
     _twin_first_node(monkeypatch, sibling=True, trim_5p=12)
 
+    joined = tmp_path / "joined"
+    run_em(corpus, joined, params=_params(rounds=1, min_aa_length=40, merge=True))
+    final = _json(joined / "rounds" / "r01" / "final.json")
+    assert final["n_merged"] == 1 and final["n_kin_refused_same"] == 0
+    merged = pq.read_table(joined / "rounds" / "r01" / "merged_final.parquet")
+    assert merged.column("delta_5p").to_pylist() == [12]
+
+    before = dict(rounds=1, min_aa_length=40, merge=True, merge_kin_exempt="identical")
     kept = tmp_path / "kept"
-    run_em(corpus, kept, params=_params(rounds=1, min_aa_length=40, merge=True))
-    assert _json(kept / "rounds" / "r01" / "final.json")["n_merged"] == 0
+    run_em(corpus, kept, params=_params(**before))
+    final = _json(kept / "rounds" / "r01" / "final.json")
+    assert final["n_merged"] == 0 and final["n_kin_refused_same"] >= 1
     edges = pq.read_table(kept / "rounds" / "r01" / "graph" / "edges.parquet")
     kin = edges.filter(edges.column("same_split_origin"))
     assert kin.num_rows >= 1 and not any(kin.column("mergeable").to_pylist())
 
-    joined = tmp_path / "joined"
-    run_em(
-        corpus,
-        joined,
-        params=_params(rounds=1, min_aa_length=40, merge=True, merge_siblings=True),
-    )
-    final = _json(joined / "rounds" / "r01" / "final.json")
-    assert final["n_merged"] == 1
-    # Nothing rebuilds a consensus after the final merge, so the longer of
-    # the two is what is reported: no 12 nt are lost.
-    merged = pq.read_table(joined / "rounds" / "r01" / "merged_final.parquet")
-    assert merged.column("delta_5p").to_pylist() == [12]
+    asked = tmp_path / "asked"
+    run_em(corpus, asked, params=_params(**before, merge_siblings=True))
+    assert _json(asked / "rounds" / "r01" / "final.json")["n_merged"] == 1
 
 
 @needs_minimap2

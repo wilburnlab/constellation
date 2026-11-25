@@ -124,11 +124,18 @@ def _membership(nodes, r=1):
     )
 
 
+def _substituted(seq: str, at: int) -> str:
+    return seq[:at] + ("A" if seq[at] != "A" else "C") + seq[at + 1 :]
+
+
 @pytest.fixture
 def panel():
     """Four parents, five nodes.
 
-    node 0, 1   the two children of parent 10, differing by 12 nt of 5' extent
+    node 0, 1   the two children of parent 10, differing by 12 nt of 5'
+                extent and one substitution: a real split, which the kin
+                guard protects (a pair differing in extent alone is the
+                same, and merges: see `same_panel`)
     node 2      parent 11: byte-identical to node 0, from another lineage
     node 3      parent 12: an unrelated transcript
     node 4      parent 13: node 3 truncated by 200 nt at the 3' end
@@ -137,7 +144,7 @@ def panel():
     a, b = _rnd(rng, 900), _rnd(rng, 1100)
     rows = [
         (10, 0, 0, a, 30),
-        (10, 0, 1, a[12:], 8),
+        (10, 0, 1, _substituted(a, 450)[12:], 8),
         (11, 1, 0, a, 5),
         (12, 2, 0, b, 40),
         (13, 3, 0, b[:900], 6),
@@ -686,6 +693,29 @@ def test_a_round_that_merged_commits_its_predicate_and_its_graph(tmp_path):
     )
 
 
+def test_a_run_recorded_before_kin_exempt_merged_under_the_byte_identical_rule(
+    tmp_path,
+):
+    """A predicate written before 2026-11-24 has no ``kin_exempt``: its rounds
+    let kin merge only when byte-identical. Resumed under the new rule the
+    later rounds would descend from both, so it is refused, by name; asked
+    for the old rule, it continues."""
+    old = EmParams(merge=True, merge_kin_exempt="identical")
+    record = _record(old, 1, merged=True)
+    del record["predicate"]["kin_exempt"]
+    rounds_dir = _finished(tmp_path, {1: record, 2: None})
+    with pytest.raises(ValueError, match="only when they are byte-identical"):
+        _check_merge_state(rounds_dir, EmParams(merge=True), resume=True)
+    _check_merge_state(rounds_dir, old, resume=True)
+    # And a run recorded under the new rule keeps it.
+    rounds_dir = _finished(
+        tmp_path / "new", {1: _record(EmParams(merge=True), 1, merged=True), 2: None}
+    )
+    _check_merge_state(rounds_dir, EmParams(merge=True), resume=True)
+    with pytest.raises(ValueError, match="merge predicate"):
+        _check_merge_state(rounds_dir, old, resume=True)
+
+
 def test_a_run_merged_by_the_removed_detector_cannot_be_resumed(tmp_path):
     rounds_dir = _finished(
         tmp_path,
@@ -761,6 +791,32 @@ def test_the_report_counts_what_is_there_after_the_merge(panel, tmp_path):
     assert section.body.count("Final output") == 1
     assert "redundant" not in section.body
     assert not section.flags
+
+
+def test_the_report_flags_same_kin_kept_apart_and_not_same_kin_merged(tmp_path):
+    """A kin merge of a pair that is the same is the rule working, not the
+    split/merge cycle; the report flags same kin only where the rule before
+    (byte-identical kin) kept them apart."""
+    a = _rnd(random.Random(13), 900)
+    nodes = _nodes([(10, 0, 0, a, 8), (10, 0, 1, a[12:], 6)])
+    for name, params, want in (
+        ("same", EmParams(threads=1, merge=True), None),
+        (
+            "before",
+            EmParams(threads=1, merge=True, merge_kin_exempt="identical"),
+            "1 pairs that are the same",
+        ),
+    ):
+        run = tmp_path / name / "run"
+        rd = _rd(tmp_path / name, 1)
+        _refine_and_merge(rd, nodes, _store([10]), 1, params, _log)
+        _done(rd)
+        flags = section_template_graph(run).flags
+        assert not any("split/merge cycle" in f for f in flags)
+        assert [f for f in flags if "are the same" in f] == (
+            [] if want is None else [f for f in flags if want in f]
+        )
+        assert want is None or any(want in f for f in flags)
 
 
 def test_the_report_flags_twins_left_in_the_final_output(panel, tmp_path):
@@ -874,14 +930,21 @@ def hub():
 
     node 0   parent 10, 8 reads    the full transcript
     node 1   parent 10, 6 reads    its sibling, 12 nt shorter at the 5' end
+                                   and one substitution apart: a real split
     node 2   parent 11, 50 reads   the hub: 6 nt shorter
 
     Pairwise the hub is mergeable with each child and the children are not
     mergeable with each other — the stored `mergeable` column says exactly
-    that. Only the grouping can put all three together.
+    that. Only the grouping can put all three together. (Children that
+    differ in extent alone are the same, and do merge: see
+    `test_a_split_whose_children_are_the_same_is_undone`.)
     """
     a = _rnd(random.Random(13), 900)
-    rows = [(10, 0, 0, a, 8), (10, 0, 1, a[12:], 6), (11, 1, 0, a[6:], 50)]
+    rows = [
+        (10, 0, 0, a, 8),
+        (10, 0, 1, _substituted(a, 450)[12:], 6),
+        (11, 1, 0, a[6:], 50),
+    ]
     return _nodes(rows), _store([10, 11])
 
 
@@ -905,6 +968,58 @@ def test_the_hub_does_not_rejoin_a_split_between_rounds(hub, tmp_path):
     )
     assert joined.n_merged == 2
     assert _json(rd2 / "refine.json")["n_merged_kin"] == 0, "neither is kin of the HUB"
+
+
+def test_a_split_whose_children_are_the_same_is_undone(tmp_path):
+    """Two children of one split that differ in extent alone (12 nt at the
+    5' end, no edits) are the same, and a split that made them separated
+    nothing: the kin guard lets them merge, between rounds and in the final
+    output (2026-11-24). Under the rule before only byte-identical kin could,
+    and the refusal is counted as `n_kin_refused_same`."""
+    a = _rnd(random.Random(13), 900)
+    nodes = _nodes([(10, 0, 0, a, 8), (10, 0, 1, a[12:], 6)])
+    store = _store([10])
+    rd = _rd(tmp_path)
+    refined = _refine_and_merge(rd, nodes, store, 1, EmParams(threads=1, merge=True), _log)
+    assert refined.n_merged == 1
+    record = _json(rd / "refine.json")
+    assert record["n_merged_kin"] == 1 and record["n_kin_refused_same"] == 0
+    assert record["predicate"]["kin_exempt"] == "same"
+
+    before = EmParams(threads=1, merge=True, merge_kin_exempt="identical")
+    rd_old = _rd(tmp_path / "before")
+    kept = _refine_and_merge(rd_old, nodes, store, 1, before, _log)
+    assert kept.n_merged == 0
+    assert _json(rd_old / "refine.json")["n_kin_refused_same"] == 1
+
+    member = _membership(nodes)
+    _, _, final = _final_graph_and_merge(
+        _rd(tmp_path / "final"), nodes, member, 1, EmParams(threads=1, merge=True), _log
+    )
+    assert final["n_merged"] == 1 and final["n_kin_refused_same"] == 0
+    _, _, final_old = _final_graph_and_merge(
+        _rd(tmp_path / "final_before"), nodes, member, 1, before, _log
+    )
+    assert final_old["n_merged"] == 0 and final_old["n_kin_refused_same"] == 1
+
+
+def test_a_shorter_template_does_not_rejoin_siblings_that_differ_beyond_it(tmp_path):
+    """Sameness is not transitive. Two siblings two edits apart within their
+    first 11 nt, and a deeper template from another lineage lacking their
+    first 20 nt: it is the same as each, and they are not the same as each
+    other. It takes one; the split between them stands (Codex's review of
+    the kin exemption, 2026-11-25)."""
+    a = _rnd(random.Random(13), 900)
+    other = _substituted(_substituted(a, 5), 10)
+    nodes = _nodes([(10, 0, 0, a, 8), (10, 0, 1, other, 6), (11, 1, 0, a[20:], 50)])
+    rd = _rd(tmp_path)
+    refined = _refine_and_merge(
+        rd, nodes, _store([10, 11]), 1, EmParams(threads=1, merge=True), _log
+    )
+    rel = _relations(rd / "graph" / "edges.parquet")
+    assert rel[(2, 0)] == ("equivalent", True) and rel[(2, 1)] == ("equivalent", True)
+    assert rel[(0, 1)] == ("equivalent", False), "kin, two edits apart"
+    assert refined.n_merged == 1 and refined.templates.num_rows == 2
 
 
 def test_the_hub_does_not_rejoin_the_split_a_round_later(hub, tmp_path):
@@ -937,7 +1052,7 @@ def test_the_hub_does_not_rejoin_the_split_a_round_later(hub, tmp_path):
     )
     second = _refine_and_merge(rd2, again, _store(ids), 2, params, _log)
     edges = pq.read_table(rd2 / "graph" / "edges.parquet").to_pylist()
-    assert [(e["relation"], e["n_edits"]) for e in edges] == [("equivalent", 0)]
+    assert [(e["relation"], e["n_edits"]) for e in edges] == [("equivalent", 1)]
     assert edges[0]["same_split_origin"] and not edges[0]["mergeable"]
     assert second.n_merged == 0 and second.templates.num_rows == 2
 
@@ -945,9 +1060,16 @@ def test_the_hub_does_not_rejoin_the_split_a_round_later(hub, tmp_path):
 def test_the_hub_does_not_rejoin_a_split_in_the_final_output(tmp_path):
     """The final merge claims longest first, so there the hub that could
     rejoin a split is the LONGEST of the three: the full transcript, from
-    another lineage than the two children, which are 6 and 12 nt shorter."""
+    another lineage than the two children, which are 6 and 12 nt shorter
+    and one substitution apart."""
     a = _rnd(random.Random(13), 900)
-    nodes = _nodes([(10, 0, 0, a[6:], 8), (10, 0, 1, a[12:], 6), (11, 1, 0, a, 50)])
+    nodes = _nodes(
+        [
+            (10, 0, 0, a[6:], 8),
+            (10, 0, 1, _substituted(a, 450)[12:], 6),
+            (11, 1, 0, a, 50),
+        ]
+    )
     member = _membership(nodes)
     rd = _rd(tmp_path)
     out_nodes, mem, final = _final_graph_and_merge(
@@ -1046,7 +1168,8 @@ def test_the_final_survivor_is_the_deepest_and_is_rebuilt_from_the_pool(hub, tmp
     assert rebuilt["n_members_used"] == 58 and rebuilt["subsample_fraction"] == 1.0
     assert rebuilt["n_extended_5p"] == 0, "8 flanked reads against 50 anchored"
     untouched = out_nodes.slice(0, 1).to_pylist()[0]
-    assert untouched["consensus"] == full[12:] and untouched["n_members_used"] == 6
+    assert untouched["consensus"] == _substituted(full, 450)[12:]
+    assert untouched["n_members_used"] == 6
 
 
 def test_the_final_merge_accepts_an_inexact_pair_within_the_cap_and_rebuilds(tmp_path):
@@ -1171,8 +1294,10 @@ def test_cluster_edges_describe_the_clusters_that_were_written(tmp_path):
     rd = _rd(tmp_path)
     # Reads 40 nt past their node's consensus exist only without the extent
     # rule (since 2026-11-20 they are refused, 40 > 30); this is about
-    # relating what a rebuild wrote, so it runs with the rule off.
-    params = EmParams(threads=1, merge=True, end_tolerance=None)
+    # relating what a rebuild wrote, so it runs with the rule off — and
+    # without the closing fold, which would join the two clusters it is
+    # about (see test_the_closing_fold_joins_what_the_rebuild_made_the_same).
+    params = EmParams(threads=1, merge=True, end_tolerance=None, final_fold_same=False)
     out_nodes, _, final = _final_graph_and_merge(
         rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
     )
@@ -1248,7 +1373,9 @@ def test_a_failure_relating_the_final_clusters_writes_no_stale_edges(
 
     nodes, corpus, _ = _stale_edge_case(tmp_path)
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, merge=True, end_tolerance=None)  # see above
+    params = EmParams(
+        threads=1, merge=True, end_tolerance=None, final_fold_same=False
+    )  # see above
     out_nodes, _, final = _final_graph_and_merge(
         rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
     )
@@ -1268,6 +1395,166 @@ def test_a_failure_relating_the_final_clusters_writes_no_stale_edges(
     assert not list(out.glob("cluster_edges.parquet*"))
     assert "the join did not fit" in final["cluster_edges_error"]
     assert any("could not be written" in line for line in said)
+
+
+def test_the_closing_fold_joins_what_the_rebuild_made_the_same(tmp_path, monkeypatch):
+    """The stale-edge case: the final merge is one pass, and the rebuild that
+    follows makes its survivor byte-identical to a node the pass had left
+    apart. The final stage ends on a sameness check that changes no
+    consensus: the two are one cluster, the deeper one's consensus kept, and
+    the clusters are related once, before the outputs (2026-11-24)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        cluster_node_table,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        FOLDED_FINAL,
+        _cluster_edges,
+    )
+
+    nodes, corpus, long = _stale_edge_case(tmp_path)
+    member = _membership(nodes)
+    rd = _rd(tmp_path)
+    params = EmParams(threads=1, merge=True, end_tolerance=None)
+    built = _spy(monkeypatch)
+    out_nodes, mem, final = _final_graph_and_merge(
+        rd, nodes, member, 1, params, _log, corpus_path=corpus
+    )
+    assert built == [1, 1], "the round's graph, then the clusters as written"
+    assert final["same_fold"] == "ok" and final["n_same_folded"] == 1
+    assert final["n_same_remaining"] == 0 and final["n_same_refused_extent"] == 0
+    assert out_nodes.column("consensus").to_pylist() == [long]
+    assert out_nodes.column("n_reads").to_pylist() == [25]
+    assert mem.num_rows == member.num_rows
+    assert final["keep_rows"].tolist() == [0] and final["rebuilt_rows"].tolist() == [0]
+    folded = pq.read_table(rd / FOLDED_FINAL).to_pylist()
+    assert [(f["absorbed_n_reads"], f["delta_5p"]) for f in folded] == [(9, 0)]
+
+    table = cluster_node_table(
+        out_nodes,
+        round_index=1,
+        keep_rows=final["keep_rows"],
+        rebuilt_rows=final["rebuilt_rows"],
+        merged=pq.read_table(rd / "merged_final.parquet"),
+        folded=pq.read_table(rd / FOLDED_FINAL),
+    ).to_pylist()
+    assert table[0]["rebuilt"] and table[0]["n_absorbed"] == 1
+    assert table[0]["n_folded"] == 1
+    assert table[0]["folded_node_template_ids"] == [folded[0]["absorbed_template_id"]]
+
+    out = tmp_path / "run_out"
+    out.mkdir()
+    paths: dict = {}
+    counts = _cluster_edges(out, final, _clusters(out_nodes), paths, _log, rd=rd, params=params)
+    assert built == [1, 1], "the export reads the clusters as related, not again"
+    assert final["cluster_edges_source"] == "final_clusters"
+    assert counts["n_cluster_edges"] == 0 and counts["n_twin_clusters"] == 0
+
+    off = EmParams(threads=1, merge=True, end_tolerance=None, final_fold_same=False)
+    two, _, final_off = _final_graph_and_merge(
+        _rd(tmp_path / "off"), nodes, member, 1, off, _log, corpus_path=corpus
+    )
+    assert two.column("consensus").to_pylist() == [long, long]
+    assert final_off["same_fold"] == "off"
+
+
+def test_extent_refusals_answer_for_every_read_and_stop_at_the_first(
+    tmp_path, monkeypatch
+):
+    """The fold's only question about a pair that is already the same: would
+    the survivor's ends refuse some read of the absorbed cluster? Reads 10 nt
+    past a node that is itself 25 nt past the survivor are 35 nt past it.
+    EVERY read answers, not the rebuild's member sample (which let an
+    outlier beyond the cap move unexamined, Codex's review 2026-11-25): one
+    such read among 40 refuses its node. The walk stops at the first
+    refusal."""
+    from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
+    from constellation.sequencing.transcriptome.cluster.denovo.em import rebuild as rb
+
+    rng = random.Random(31)
+    flank, body = _rnd(rng, 35), _rnd(rng, 800)
+    survivor, near, far = body, flank[10:] + body, flank + body
+    nodes = _nodes(
+        [
+            (10, 0, 0, survivor, 5),
+            (11, 1, 0, near, 40),
+            (12, 2, 0, near, 4),
+            (13, 3, 0, near, 4),
+        ]
+    )
+    reads = [survivor] * 5 + [near] * 29 + [far] + [near] * 10 + [near] * 4 + [far] * 4
+    corpus = tmp_path / "reads.arrow"
+    table = pa.table(
+        {
+            "read_id": pa.array([f"r{i}" for i in range(len(reads))], pa.string()),
+            "sequence": pa.array(reads, pa.large_string()),
+            "sample_id": pa.array(np.zeros(len(reads), np.int64)),
+            "dorado_quality": pa.array(np.full(len(reads), 30.0, np.float32)),
+        },
+        schema=_READS_SCHEMA,
+    )
+    with pa.OSFile(str(corpus), "wb") as sink, pa.ipc.new_file(sink, _READS_SCHEMA) as w:
+        w.write_table(table)
+    member = _membership(nodes)
+    kw = dict(identity_floor=0.97, threads=1)
+    got = rb.extent_refusals(
+        nodes, member, [1, 2, 3], [0, 0, 0], str(corpus), end_tolerance=30, **kw
+    )
+    assert got.tolist() == [True, False, True]
+    assert not rb.extent_refusals(
+        nodes, member, [1, 3], [0, 0], str(corpus), end_tolerance=None, **kw
+    ).any()
+
+    calls = []
+    real = rb.align_to_survivor
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(rb, "align_to_survivor", spy)
+    assert rb.extent_refusals(
+        nodes, member, [3], [0], str(corpus), end_tolerance=30, **kw
+    ).tolist() == [True]
+    assert len(calls) == 1, "its first read refused; nothing more is aligned"
+
+
+def test_a_refused_fold_does_not_crowd_out_one_that_is_allowed():
+    """Three clusters the same as the deepest: one 20 nt past its 5' end, one
+    15 nt short of it — 35 apart, so the group can hold only one, and the
+    better supported is proposed first. Its reads are refused for extent.
+    Removing it after the grouping left the other apart for nothing; the
+    grouping is made again without the refused pair (Codex's review,
+    2026-11-25)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _select_same_folds,
+    )
+
+    pairs = {
+        "src_row": np.array([0, 0]),
+        "dst_row": np.array([1, 2]),
+        "off_5p": np.array([20, -15]),
+        "off_3p": np.array([0, 0]),
+        "kin_exempt": np.array([True, True]),
+    }
+    asked = []
+
+    def refuses(absorbed, into):
+        asked.extend(zip(absorbed.tolist(), into.tolist()))
+        return absorbed == 1
+
+    survivor, n_refused = _select_same_folds(
+        3,
+        pairs,
+        np.array([50, 20, 10]),
+        np.array([900, 920, 885]),
+        tol_5p=30,
+        tol_3p=30,
+        origin=None,
+        refuses=refuses,
+    )
+    assert survivor.tolist() == [0, 1, 0]
+    assert n_refused == 1
+    assert asked == [(1, 0), (2, 0)], "each pair checked once"
 
 
 def test_the_rebuild_runs_in_a_pool_and_agrees_with_the_parent(tmp_path):

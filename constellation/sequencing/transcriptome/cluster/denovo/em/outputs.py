@@ -72,6 +72,14 @@ EM_CLUSTER_NODE_TABLE: pa.Schema = pa.schema(
         # not keys — byte-identical twins share one. Null protein: no ORF.
         pa.field("consensus_content_id", pa.int64(), nullable=False),
         pa.field("protein_content_id", pa.int64(), nullable=True),
+        # The final stage's closing fold (2026-11-24; null before): clusters
+        # that had become the same as this one after the rebuild, folded in
+        # with its consensus kept. Their nodes — each folded cluster's own
+        # and what the final merge had absorbed into it — hold reads of
+        # this cluster that its consensus was not built from. `n_folded`
+        # counts the nodes listed, as `n_absorbed` does.
+        pa.field("n_folded", pa.int32(), nullable=True),
+        pa.field("folded_node_template_ids", pa.list_(pa.int64()), nullable=True),
     ],
     metadata={b"schema_name": b"EmClusterNodeTable"},
 )
@@ -85,6 +93,7 @@ def cluster_node_table(
     keep_rows: np.ndarray | None = None,
     rebuilt_rows: np.ndarray | None = None,
     merged: pa.Table | None = None,
+    folded: pa.Table | None = None,
 ) -> pa.Table:
     """:data:`EM_CLUSTER_NODE_TABLE` for the final clusters.
 
@@ -92,7 +101,8 @@ def cluster_node_table(
     ``keep_rows`` the rows of the last round's node table they came from
     (identity when nothing was merged or there was no graph);
     ``rebuilt_rows`` the clusters the final merge rebuilt; ``merged`` the
-    final merge's ``MERGED_TABLE``.
+    final merge's ``MERGED_TABLE``; ``folded`` the closing fold's (``None``:
+    no fold ran, and the two fold columns are null).
     """
     from constellation.core.ids import content_ids
     from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
@@ -121,6 +131,17 @@ def cluster_node_table(
         ):
             absorbed.setdefault(int(surv), []).append(int(a))
     lists = [sorted(absorbed.get(int(i), [])) for i in node_id.tolist()]
+    folded_lists = None
+    if folded is not None:
+        into: dict[int, list[int]] = {}
+        for a, surv in zip(
+            folded.column("absorbed_template_id").to_pylist(),
+            folded.column("survivor_template_id").to_pylist(),
+        ):
+            # A folded cluster brings its own node and what the merge had
+            # absorbed into it.
+            into.setdefault(int(surv), []).extend([int(a), *absorbed.get(int(a), [])])
+        folded_lists = [sorted(into.get(int(i), [])) for i in node_id.tolist()]
     rebuilt = np.zeros(n, dtype=bool)
     if rebuilt_rows is not None and len(rebuilt_rows):
         rebuilt[np.asarray(rebuilt_rows, dtype=np.int64)] = True
@@ -139,6 +160,16 @@ def cluster_node_table(
                 nodes.column("consensus").to_pylist()
             ),
             "protein_content_id": content_ids(proteins),
+            "n_folded": (
+                pa.nulls(n, pa.int32())
+                if folded_lists is None
+                else pa.array(np.array([len(x) for x in folded_lists], np.int32))
+            ),
+            "folded_node_template_ids": (
+                pa.nulls(n, pa.list_(pa.int64()))
+                if folded_lists is None
+                else pa.array(folded_lists, pa.list_(pa.int64()))
+            ),
         },
         schema=EM_CLUSTER_NODE_TABLE,
     )
@@ -541,6 +572,8 @@ def write_cluster_edges(
     clusters: pa.Table,
     *,
     batch_rows: int = 1 << 20,
+    cluster_origin: np.ndarray | None = None,
+    predicate=None,
 ) -> tuple[Path, dict[str, int]]:
     """Project the final round's edges onto the clusters that were written.
 
@@ -557,6 +590,10 @@ def write_cluster_edges(
     accepts that are still there — refused by a group guard, or inexact where
     the final merge is exact) and ``n_twin_clusters`` (clusters byte-identical
     to another one).
+
+    ``cluster_origin`` and ``predicate`` (both or neither) re-decide each
+    edge's ``same_split_origin`` and ``mergeable`` for the clusters as
+    written (:func:`~.graph.cluster_edges`).
     """
     from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
         CLUSTER_EDGE_TABLE,
@@ -597,6 +634,8 @@ def write_cluster_edges(
                 keep_rows,
                 cluster_len=cluster_len,
                 cluster_n_reads=cluster_n_reads,
+                cluster_origin=cluster_origin,
+                predicate=predicate,
             )
             if out.num_rows == 0:
                 continue

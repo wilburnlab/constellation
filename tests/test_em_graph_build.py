@@ -1245,9 +1245,28 @@ def test_the_less_supported_end_decides_the_depth_gate():
     assert not verdict(swapped, MergePredicate(min_reads=11))
 
 
-def test_split_kin_do_not_merge_unless_asked():
-    assert not verdict({"same_split_origin": True})
-    assert verdict({"same_split_origin": True}, MergePredicate(merge_siblings=True))
+def test_split_kin_do_not_merge_unless_the_same_or_asked():
+    """The guard protects the M-step's splits from the edit-count merge:
+    kin an edit apart stay apart unless ``merge_siblings``. Kin that are the
+    same — the base edge: no edits, ends 4 / 6 nt apart — separated nothing
+    and merge (2026-11-24); under the rule before they did not."""
+    loose = MergePredicate(max_edits=2)
+    assert verdict({"same_split_origin": True})
+    assert not verdict({"same_split_origin": True, "n_edits": 1}, loose)
+    assert verdict(
+        {"same_split_origin": True, "n_edits": 1},
+        MergePredicate(max_edits=2, merge_siblings=True),
+    )
+    before = MergePredicate(kin_exempt="identical")
+    assert not verdict({"same_split_origin": True}, before)
+    assert verdict(
+        {"same_split_origin": True},
+        MergePredicate(kin_exempt="identical", merge_siblings=True),
+    )
+    # Being the same does not stretch the tolerance it is judged within.
+    assert not verdict({"same_split_origin": True, "dst_overhang_5p": 31})
+    with pytest.raises(ValueError):
+        MergePredicate(kin_exempt="twins")
 
 
 _IDENTICAL = {
@@ -1274,9 +1293,27 @@ def test_byte_identical_kin_merge_anyway():
     ],
 )
 def test_kin_that_differ_at_all_are_not_byte_identical(change):
-    loose = MergePredicate(max_edits=5)
+    loose = MergePredicate(max_edits=5, kin_exempt="identical")
     assert not verdict(_IDENTICAL | change, loose)
     assert verdict(_IDENTICAL | change | {"same_split_origin": False}, loose)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"n_edits": 1},
+        {"dst_len": 1001},
+        {"src_overhang_5p": 1},
+        {"src_overhang_3p": 1},
+        {"dst_overhang_5p": 1},
+        {"dst_overhang_3p": 1},
+    ],
+)
+def test_kin_are_exempt_when_the_same_not_only_when_byte_identical(change):
+    """Under ``kin_exempt="same"`` an end or a length within the tolerance
+    does not make kin different; an edit does."""
+    loose = MergePredicate(max_edits=5)
+    assert verdict(_IDENTICAL | change, loose) is ("n_edits" not in change)
 
 
 def test_exact_only_overrides_the_edit_allowance():
@@ -1294,7 +1331,7 @@ def test_every_edge_is_judged_alone():
         {"relation": "contained", "truncation": "both"},
         {"src_overhang_3p": 31},
         _IDENTICAL,
-        {"same_split_origin": True},
+        {"same_split_origin": True, "src_overhang_5p": 31},
     ]
     table = edges_of(*changes)
     want = [True, False, False, False, True, False]
@@ -1395,10 +1432,13 @@ def test_mergeable_pairs_are_the_mergeable_edges(family):
         "off_5p",
         "off_3p",
         "identical",
+        "kin_exempt",
     ]
     assert all(v.shape == (int(keep.sum()),) for v in got.values())
     assert all(got[k].dtype == np.int64 for k in list(got)[:6])
-    assert got["identical"].dtype == bool
+    assert got["identical"].dtype == bool and got["kin_exempt"].dtype == bool
+    # Byte-identical pairs are a subset of the same ones.
+    assert not (got["identical"] & ~got["kin_exempt"]).any()
     kept = t.filter(pa.array(keep)).to_pydict()
     assert got["src_row"].tolist() == kept["src_row"]
     assert got["dst_row"].tolist() == kept["dst_row"]
@@ -1420,12 +1460,13 @@ def test_mergeable_pairs_are_the_mergeable_edges(family):
     ]
     assert got["identical"].tolist() == twins
     assert 0 < sum(twins) < len(twins)
+    assert got["kin_exempt"].tolist() == [e == 0 for e in kept["n_edits"]]
 
     exact = mergeable_pairs(t, pred, exact_only=True)
     assert 0 < exact["src_row"].shape[0] < got["src_row"].shape[0]
     assert exact["src_row"].shape[0] == int(is_mergeable(t, MergePredicate()).sum())
     none = mergeable_pairs(t.slice(0, 0), pred)
-    assert [v.shape for v in none.values()] == [(0,)] * 7
+    assert [v.shape for v in none.values()] == [(0,)] * 8
 
 
 # ──────────────────────────────────────────────────────────────────────

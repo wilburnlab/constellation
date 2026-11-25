@@ -49,7 +49,7 @@ def _cover(
         tol_5p=tol_5p,
         tol_3p=tol_3p,
         origin=None if origin is None else np.asarray(origin, dtype=np.int64),
-        edge_identical=None if identical is None else np.asarray(identical, bool),
+        edge_kin_exempt=None if identical is None else np.asarray(identical, bool),
     )
 
 
@@ -214,11 +214,33 @@ def test_a_claimant_refuses_its_own_sibling():
 
 
 def test_byte_identical_siblings_merge_despite_sharing_an_origin():
-    """Reads cannot tell them apart, so merging them moves nothing."""
+    """Reads cannot tell them apart, so merging them moves nothing. Byte
+    identity is transitive, so the graph writes the siblings' own edge too
+    (every pair of a byte-identical class), and the guard reads it."""
     res = _cover(
-        3, [B, A, C], HUB, origin=[PARENT, OTHER_PARENT, PARENT], identical=[1, 1]
+        3,
+        [B, A, C],
+        HUB + [(A, C, 0, 0)],
+        origin=[PARENT, OTHER_PARENT, PARENT],
+        identical=[1, 1, 1],
     )
     assert _groups(res) == [[A, B, C]]
+
+
+def test_kin_the_same_as_the_claimant_must_be_the_same_as_each_other():
+    """Sameness is not transitive: a claimant without the siblings' first 20
+    nt is the same as both, while the siblings differ by two edits inside
+    those 20 nt — their own edge is not exempt, or not there at all (kin an
+    edit apart are not mergeable). One sibling joins; the other stays."""
+    for kin_edge in ([], [(A, C, 0, 0)]):
+        res = _cover(
+            3,
+            [B, A, C],
+            [(B, A, 20, 0), (B, C, 20, 0)] + kin_edge,
+            origin=[PARENT, OTHER_PARENT, PARENT],
+            identical=[1, 1] + [0] * len(kin_edge),
+        )
+        assert _groups(res) == [[A, B], [C]]
 
 
 @pytest.mark.parametrize("identical", [[True, False], [False, True]])
@@ -238,10 +260,20 @@ def test_a_claimant_takes_its_own_sibling_when_byte_identical():
 def test_a_third_twin_joins_two_already_merged():
     """The exemption is a property of the whole kin set, not of its first pair."""
     edges = [(0, 1, 0, 0), (0, 2, 0, 0), (0, 3, 0, 0)]
+    among = [(1, 2, 0, 0), (1, 3, 0, 0), (2, 3, 0, 0)]
     origin = [OTHER_PARENT, PARENT, PARENT, PARENT]
-    res = _cover(4, [0, 1, 2, 3], edges, origin=origin, identical=[1, 1, 1])
+    res = _cover(
+        4, [0, 1, 2, 3], edges + among, origin=origin, identical=[1, 1, 1, 1, 1, 1]
+    )
     assert _groups(res) == [[0, 1, 2, 3]]
-    res = _cover(4, [0, 1, 2, 3], edges, origin=origin, identical=[1, 1, 0])
+    res = _cover(
+        4, [0, 1, 2, 3], edges + among, origin=origin, identical=[1, 1, 0, 1, 0, 0]
+    )
+    assert _groups(res) == [[0, 1, 2], [3]]
+    # Each pair of the kin set, not only each against the claimant.
+    res = _cover(
+        4, [0, 1, 2, 3], edges + among, origin=origin, identical=[1, 1, 1, 1, 0, 1]
+    )
     assert _groups(res) == [[0, 1, 2], [3]]
 
 
@@ -383,7 +415,7 @@ def test_it_follows_the_specification_where_the_guards_bind(seed, kin_guard):
         origin = same = None
     tol = dict(tol_5p=30, tol_3p=30)
     res = guarded_set_cover(
-        n, order, a, b, o5, o3, origin=origin, edge_identical=same, **tol
+        n, order, a, b, o5, o3, origin=origin, edge_kin_exempt=same, **tol
     )
 
     label, centroids = _by_the_book(
@@ -415,7 +447,7 @@ def test_the_twin_exemption_is_exercised_by_the_randomized_cases():
             tol_5p=30,
             tol_3p=30,
             origin=origin,
-            edge_identical=same,
+            edge_kin_exempt=same,
         )
         for cid in range(res.centroid_uniq.shape[0]):
             kin = origin[res.cluster_of == cid]
@@ -430,7 +462,7 @@ def test_the_twin_exemption_is_exercised_by_the_randomized_cases():
 def test_the_result_does_not_depend_on_edge_order_or_orientation():
     n, order, a, b, o5, o3, origin, same = _binding_case(11)
     kw = dict(tol_5p=30, tol_3p=30, origin=origin)
-    base = guarded_set_cover(n, order, a, b, o5, o3, edge_identical=same, **kw)
+    base = guarded_set_cover(n, order, a, b, o5, o3, edge_kin_exempt=same, **kw)
 
     rng = np.random.default_rng(12)
     for _ in range(5):
@@ -443,7 +475,7 @@ def test_the_result_does_not_depend_on_edge_order_or_orientation():
             np.where(flip, a, b)[by],
             np.where(flip, -o5, o5)[by],
             np.where(flip, -o3, o3)[by],
-            edge_identical=same[by],
+            edge_kin_exempt=same[by],
             **kw,
         )
         np.testing.assert_array_equal(res.cluster_of, base.cluster_of)
@@ -454,7 +486,7 @@ def test_self_edges_and_repeated_pairs_change_nothing():
     """The repeats contradict their originals, so using one would show."""
     n, order, a, b, o5, o3, origin, same = _binding_case(21)
     kw = dict(tol_5p=30, tol_3p=30, origin=origin)
-    base = guarded_set_cover(n, order, a, b, o5, o3, edge_identical=same, **kw)
+    base = guarded_set_cover(n, order, a, b, o5, o3, edge_kin_exempt=same, **kw)
 
     rng = np.random.default_rng(22)
     again = rng.choice(a.shape[0], 300, replace=False)
@@ -467,7 +499,7 @@ def test_self_edges_and_repeated_pairs_change_nothing():
         np.concatenate([b, np.where(flip, a[again], b[again]), loops]),
         np.concatenate([o5, o5[again] + 100, np.full(50, 500)]),
         np.concatenate([o3, o3[again] - 100, np.full(50, -500)]),
-        edge_identical=np.concatenate([same, ~same[again], np.ones(50, bool)]),
+        edge_kin_exempt=np.concatenate([same, ~same[again], np.ones(50, bool)]),
         **kw,
     )
 

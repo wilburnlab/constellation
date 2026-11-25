@@ -1436,3 +1436,94 @@ def test_a_round_that_never_measured_a_runner_up_says_unknown(runs, tmp_path):
     assert round_runner_up_measured(old_rd) is False
     # Later rounds do measure it.
     assert all(round_runner_up_measured(d) for d in _rounds(runs[3])[1:])
+
+
+def test_a_cluster_lists_the_reads_the_closing_fold_gave_it(runs, tmp_path):
+    """The final stage's closing fold joins a cluster to one it had become the
+    same as, keeping the survivor's consensus (2026-11-24). Replay re-creates
+    that consensus from its own pool, unchanged, and lists the folded
+    cluster's reads beside it: members, from their own node, never aligned
+    to the survivor's frame. Declared here on a copy of the run, since the
+    panel's rebuild leaves nothing the same."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        EM_CLUSTER_NODE_TABLE,
+    )
+
+    out = tmp_path / "copy"
+    shutil.copytree(runs[1], out)
+    path = out / "cluster_nodes.parquet"
+    rows = pq.read_table(path).to_pylist()
+    assert all(r["n_folded"] == 0 for r in rows), "the run folded nothing"
+    rebuilt = next(r for r in rows if r["rebuilt"])
+    plain = next(r for r in rows if not r["rebuilt"] and not r["n_absorbed"])
+    rebuilt["n_folded"] = 1
+    rebuilt["folded_node_template_ids"] = [plain["node_template_id"]]
+    pq.write_table(pa.Table.from_pylist(rows, schema=EM_CLUSTER_NODE_TABLE), path)
+
+    members = pq.read_table(out / "cluster_membership.parquet")
+
+    def reads_of(cid):
+        return set(
+            members.filter(pa.compute.equal(members.column("cluster_id"), cid))
+            .column("read_id")
+            .to_pylist()
+        )
+
+    rep = R.replay_cluster(out, rebuilt["cluster_id"])
+    assert rep.kind == "rebuilt" and rep.verified, rep.mismatch
+    assert set(rep.folded_read_ids.to_pylist()) == reads_of(plain["cluster_id"])
+    assert set(rep.folded_node_template_id.tolist()) == {plain["node_template_id"]}
+    st = R.support_tables(rep)
+    got = st.reads.column("read_id").to_pylist()
+    assert len(got) == len(set(got))
+    assert set(got) == reads_of(rebuilt["cluster_id"]) | reads_of(plain["cluster_id"])
+    folded = st.reads.filter(
+        pa.compute.equal(st.reads.column("absorbed_from"), plain["node_template_id"])
+    )
+    assert set(folded.column("read_id").to_pylist()) == reads_of(plain["cluster_id"])
+    assert any("folded into it" in w for w in st.warnings)
+    assert R.replay_summary(rep)["n_folded_reads"] == len(reads_of(plain["cluster_id"]))
+
+
+def test_a_round_recorded_before_a_counter_existed_still_verifies(
+    runs, tmp_path, split_template_id
+):
+    """`n_excluded_extension` and `n_folded_same` joined the template record on
+    2026-11-24. A round recorded before has no such column (null when read),
+    which is not a disagreement; replays of the Nov2026 run failed on exactly
+    that. A counter the round DID record is still checked."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        KERNEL_COUNTERS_ADDED,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        index_round,
+    )
+
+    out = tmp_path / "copy"
+    shutil.copytree(runs[1], out)
+    index = index_round(out / "rounds" / "r01")
+    unit = int(index.node_unit[index.node_rows_of(split_template_id)[0]])
+    path = index.shards["templates"][unit]
+    table = pq.read_table(path)
+    older = table.drop_columns(sorted(KERNEL_COUNTERS_ADDED))
+    pq.write_table(older, path)
+    rep = R.replay_template(out, 1, split_template_id)
+    assert rep.verified, rep.mismatch
+
+    mine = pa.compute.equal(table.column("template_id"), split_template_id).to_numpy(
+        zero_copy_only=False
+    )
+    wrong = table.column("n_folded_same").to_numpy(zero_copy_only=False).copy()
+    wrong[np.flatnonzero(mine)[0]] = 5
+    pq.write_table(
+        table.set_column(
+            table.schema.get_field_index("n_folded_same"),
+            "n_folded_same",
+            pa.array(wrong, pa.int64()),
+        ),
+        path,
+    )
+    rep = R.replay_template(out, 1, split_template_id)
+    assert "record n_folded_same differs" in rep.mismatch

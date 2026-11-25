@@ -866,6 +866,14 @@ class MergePredicate:
     #: Merge two templates an M-step split apart. Off, because that is the
     #: split/merge cycle: 51.6% of the removed detector's merges were these.
     merge_siblings: bool = False
+    #: Which kin the split-origin guard lets through (:data:`KIN_EXEMPT`).
+    #: ``"same"`` (2026-11-24): kin that are ``equivalent`` with no edits —
+    #: the same sequence, ends within the tolerance — because a split whose
+    #: children are the same separated nothing; the guard protects splits
+    #: that differ by an edit. ``"identical"``: byte-identical kin only (0
+    #: edits, no overhang, equal length), the rule before, under which Nov2026
+    #: round 12 refused 114,781 same pairs and kept their 4.72M reads apart.
+    kin_exempt: str = "same"
 
     def __post_init__(self) -> None:
         for name in ("max_edits", "tol_5p", "tol_3p", "min_reads"):
@@ -878,6 +886,17 @@ class MergePredicate:
             raise ValueError(
                 f"merge_siblings must be a bool, got {self.merge_siblings!r}"
             )
+        if self.kin_exempt not in KIN_EXEMPT:
+            raise ValueError(
+                f"kin_exempt must be one of {KIN_EXEMPT}, got {self.kin_exempt!r}"
+            )
+
+
+#: What the split-origin guard exempts (``MergePredicate.kin_exempt``).
+KIN_EXEMPT = ("same", "identical")
+#: How a recorded predicate without ``kin_exempt`` reads: it was written
+#: before the field, when only byte-identical kin were exempt.
+KIN_EXEMPT_BEFORE = "identical"
 
 
 _RELATION_CODE = {name: code for code, name in RELATION_NAMES.items()}
@@ -935,21 +954,24 @@ def _predicate_columns(edges: pa.Table | pa.RecordBatch) -> dict[str, np.ndarray
 
 def _mergeable_mask(
     c: dict[str, np.ndarray], predicate: MergePredicate, exact_only: bool
-) -> tuple[np.ndarray, np.ndarray]:
-    """``(mergeable, byte-identical)`` per edge. ``relation`` is its int8
-    code here, and nothing but integer and boolean columns is read."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(mergeable, byte-identical, kin-exempt)`` per edge. ``relation`` is
+    its int8 code here, and nothing but integer and boolean columns is read.
+    Kin-exempt is what the split-origin guard lets through under
+    ``predicate.kin_exempt``: the same (no edits) or byte-identical."""
     s5, s3 = c["src_overhang_5p"], c["src_overhang_3p"]
     d5, d3 = c["dst_overhang_5p"], c["dst_overhang_3p"]
     equivalent = c["relation"] == Relation.EQUIVALENT
+    same = equivalent & (c["n_edits"] == 0)
     identical = (
-        equivalent
-        & (c["n_edits"] == 0)
+        same
         & (s5 == 0)
         & (s3 == 0)
         & (d5 == 0)
         & (d3 == 0)
         & (c["src_len"] == c["dst_len"])
     )
+    exempt = same if predicate.kin_exempt == "same" else identical
     ok = equivalent & (c["n_edits"] <= (0 if exact_only else predicate.max_edits))
     ok &= s5 + c["div_5p"] <= predicate.tol_5p
     ok &= d5 + c["div_5p"] <= predicate.tol_5p
@@ -957,8 +979,8 @@ def _mergeable_mask(
     ok &= d3 + c["div_3p"] <= predicate.tol_3p
     ok &= np.minimum(c["src_n_reads"], c["dst_n_reads"]) >= predicate.min_reads
     if not predicate.merge_siblings:
-        ok &= ~c["same_split_origin"] | identical
-    return ok, identical
+        ok &= ~c["same_split_origin"] | exempt
+    return ok, identical, exempt
 
 
 def is_mergeable(
@@ -972,13 +994,17 @@ def is_mergeable(
         AND at each end   src overhang + div <= tol
                     and   dst overhang + div <= tol
         AND min(src_n_reads, dst_n_reads) >= min_reads
-        AND (merge_siblings OR NOT same_split_origin OR byte-identical)
+        AND (merge_siblings OR NOT same_split_origin OR kin-exempt)
 
     ``exact_only`` holds ``max_edits`` at 0 whatever the predicate says: the
     final output's merge has no M-step after it to rebuild a consensus, so it
     may join only pairs whose shared span already agrees base for base.
-    Byte-identical — no edits, no overhang, equal length — is exempt from the
-    split-origin guard, because no split can have meant it.
+    Kin-exempt, under ``kin_exempt="same"``, is an edge with no edits — the
+    same sequence, its ends within the tolerance the lines above hold them
+    to — and under ``"identical"`` a byte-identical one (no overhang, equal
+    length too). Either way it is a pair no split can have meant: the guard
+    protects the M-step's splits from the edit-count merge, and a split whose
+    children are the same separated nothing.
 
     Decided on the integer columns and never on ``identity``, whose last
     digits depend on which co-optimal path was traced. The stored
@@ -997,13 +1023,17 @@ def mergeable_pairs(
     ``src_template_id`` / ``dst_template_id`` / ``src_row`` / ``dst_row`` are
     int64. ``off_5p`` / ``off_3p`` (int64, signed) are how far ``dst`` reaches
     beyond ``src`` at that end — ``delta_5p`` / ``delta_3p``. ``identical`` is
-    True for a byte-identical pair.
+    True for a byte-identical pair; ``kin_exempt`` for a pair the
+    split-origin guard lets through (``predicate.kin_exempt``), which is
+    what the per-group guard reads.
 
     Merge on the template ids. A row is a row of the node set the graph was
     built over, which stops being a row of the next round's templates as soon
     as one node has an empty consensus.
     """
-    keep, identical = _mergeable_mask(_predicate_columns(edges), predicate, exact_only)
+    keep, identical, exempt = _mergeable_mask(
+        _predicate_columns(edges), predicate, exact_only
+    )
     out = {
         name: _column(edges, name).astype(np.int64)[keep]
         for name in ("src_template_id", "dst_template_id", "src_row", "dst_row")
@@ -1011,6 +1041,7 @@ def mergeable_pairs(
     out["off_5p"] = _column(edges, "delta_5p").astype(np.int64)[keep]
     out["off_3p"] = _column(edges, "delta_3p").astype(np.int64)[keep]
     out["identical"] = identical[keep]
+    out["kin_exempt"] = exempt[keep]
     return out
 
 
@@ -1707,7 +1738,9 @@ def _annotate(cols: dict[str, np.ndarray], nodes: _Nodes) -> dict[str, np.ndarra
         )
     c["src_n_reads"] = nodes.n_reads[src]
     c["dst_n_reads"] = nodes.n_reads[dst]
-    c["mergeable"], c["identical"] = _mergeable_mask(c, nodes.predicate, False)
+    c["mergeable"], c["identical"], c["kin_exempt"] = _mergeable_mask(
+        c, nodes.predicate, False
+    )
     return c
 
 
@@ -1754,6 +1787,9 @@ class _Tally:
                 "n_exact_nested",
                 "n_mergeable",
                 "n_same_split_origin",
+                # Same pairs (equivalent, no edits) of one split origin
+                # that the guard refused: 0 under kin_exempt="same".
+                "n_kin_refused_same",
             ),
             0,
         )
@@ -1773,6 +1809,9 @@ class _Tally:
         n["n_exact_nested"] += int((contained & exact).sum())
         n["n_mergeable"] += int(c["mergeable"].sum())
         n["n_same_split_origin"] += int((equivalent & c["same_split_origin"]).sum())
+        n["n_kin_refused_same"] += int(
+            (equivalent & exact & c["same_split_origin"] & ~c["kin_exempt"]).sum()
+        )
         self.contained += np.bincount(
             c["truncation"][contained], minlength=len(TRUNCATION_NAMES)
         )
@@ -2132,6 +2171,8 @@ def cluster_edges(
     *,
     cluster_len: np.ndarray,
     cluster_n_reads: np.ndarray,
+    cluster_origin: np.ndarray | None = None,
+    predicate: MergePredicate | None = None,
 ) -> pa.Table:
     """The edges among the nodes that survive as clusters, keyed on cluster.
 
@@ -2151,6 +2192,11 @@ def cluster_edges(
     distinct clusters, and the template edges hold each pair of rows once
     and no row against itself. For the same reason every row is decided
     alone, and a file may be passed through one record batch at a time.
+
+    ``cluster_origin`` (each cluster's split origin) with ``predicate``
+    re-decides ``same_split_origin`` and ``mergeable`` for the clusters as
+    written: a survivor inherits the origins of what it absorbed and holds
+    its reads, and both columns as stored describe the rows before that.
     """
     keep_rows = _int64_column("keep_rows", keep_rows, None)
     k = keep_rows.shape[0]
@@ -2181,6 +2227,10 @@ def cluster_edges(
     for f in EDGE_FEATURE_FIELDS:
         if f.name not in c:
             c[f.name] = _column(edges, f.name)[kept]
+    if cluster_origin is not None and predicate is not None:
+        origin = _int64_column("cluster_origin", cluster_origin, k)
+        c["same_split_origin"] = (origin[src] >= 0) & (origin[src] == origin[dst])
+        c["mergeable"] = _mergeable_mask(c, predicate, False)[0]
     return _edge_table(c, CLUSTER_EDGE_TABLE)
 
 
@@ -2190,6 +2240,8 @@ __all__ = [
     "GRAPH_KERNEL_VERSION",
     "GraphParams",
     "GraphResult",
+    "KIN_EXEMPT",
+    "KIN_EXEMPT_BEFORE",
     "MergePredicate",
     "PRODUCED_RELATIONS",
     "PairMeasurement",

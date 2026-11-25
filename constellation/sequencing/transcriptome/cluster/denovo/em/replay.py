@@ -328,6 +328,12 @@ def _mstep_params(d: dict, cls):
     if "node_extent" in known and "node_extent" not in d:
         # Recorded before 2026-11-20: a node was every column its reads covered.
         d = {**d, "node_extent": "union"}
+    if "candidate_extensions" in known and "candidate_extensions" not in d:
+        # Recorded before 2026-11-24: terminal extension columns were candidates.
+        d = {**d, "candidate_extensions": True}
+    if "fold_same" in known and "fold_same" not in d:
+        # Recorded before 2026-11-24: children were emitted however alike.
+        d = {**d, "fold_same": False}
     unknown = sorted(set(d) - known)
     if unknown:
         raise ReplayError(
@@ -567,7 +573,13 @@ def _verify_template(index: RoundIndex, rep: TemplateReplay) -> list[str]:
             for name in ("status", "n_assigned", "n_members_used", "n_nodes_emitted"):
                 if rec[name] != getattr(got, name):
                     out.append(f"record {name} differs")
+            from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+                KERNEL_COUNTERS_ADDED,
+            )
+
             for name, value in got.counters.items():
+                if rec.get(name) is None and name in KERNEL_COUNTERS_ADDED:
+                    continue  # a round recorded before the counter existed
                 if rec.get(name) != value:
                     out.append(f"record {name} differs")
     # The compact evidence the round wrote for this template — what the
@@ -698,6 +710,15 @@ class ClusterReplay:
     absorbed_node_template_id: np.ndarray | None = None
     absorbed_read_ids: pa.Array | None = None
     absorbed_quality: np.ndarray | None = None
+    #: Any kind: the reads of clusters the final stage's closing fold joined
+    #: to this one (they had become the same after the rebuild), the node
+    #: each came from, their ids and qualities — members of the cluster that
+    #: its consensus was not built from (``cluster_nodes.parquet``'s
+    #: ``folded_node_template_ids``).
+    folded_read_row: np.ndarray | None = None
+    folded_node_template_id: np.ndarray | None = None
+    folded_read_ids: pa.Array | None = None
+    folded_quality: np.ndarray | None = None
     verified: bool = False
     mismatch: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -828,6 +849,17 @@ def replay_cluster(
             )
     else:
         out = _replay_rebuilt(run_dir, row, is_ours, params, index)
+    folded = [int(i) for i in (row.get("folded_node_template_ids") or [])]
+    if folded:
+        # Joined after the consensus was final, by design: the replay
+        # re-creates the consensus without them and lists them beside it.
+        group = _group_reads(index, folded)
+        rows = group.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+        out.folded_read_row = rows
+        out.folded_node_template_id = group.column("node_template_id").to_numpy(
+            zero_copy_only=False
+        )
+        out.folded_read_ids, out.folded_quality = _read_ids_and_quality(run_dir, rows)
     out.verified = not out.mismatch
     if strict and out.mismatch:
         raise ReplayError(f"replay of cluster {cluster_id}: {out.mismatch[:3]}")

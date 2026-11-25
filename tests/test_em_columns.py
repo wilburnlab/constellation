@@ -315,9 +315,36 @@ def test_a_jittered_start_mode_survives_the_boundary_tolerance():
     assert raw_cand.boundary_mass[raw_cov].max() <= 9.0
 
 
+def test_an_ineligible_column_leaves_the_bh_family():
+    """The M-step rules terminal extension columns out through ``eligible``
+    (2026-11-24). They leave before Benjamini–Hochberg, so every other column
+    is corrected within the eligible family, and they are counted rather
+    than silently dropped."""
+    rng = np.random.default_rng(53)
+    truth = _rand(rng, 400)
+    frame = truth[60:]
+    alt = frame[:200] + ("A" if frame[200] != "A" else "C") + frame[201:]
+    cres, stats = _stats(frame, [(truth, 10.0), (frame, 10.0), (alt, 8.0)])
+    ext = cres.column_kind == COL_EXT_5P
+    sub = int(np.flatnonzero(cres.template_of_frame == 200)[0])
+
+    every = candidate_columns(stats, coverage_route=False)
+    kept = candidate_columns(stats, coverage_route=False, eligible=~ext)
+    assert set(np.flatnonzero(ext).tolist()) & set(every.columns.tolist())
+    assert not set(np.flatnonzero(ext).tolist()) & set(kept.columns.tolist())
+    assert every.n_excluded == 0
+    assert kept.n_excluded > 0
+    assert kept.n_tested == every.n_tested - kept.n_excluded
+    # The substitution is a candidate either way, in the smaller family too.
+    assert sub in every.columns.tolist() and sub in kept.columns.tolist()
+    with pytest.raises(ValueError):
+        candidate_columns(stats, eligible=np.ones(3, dtype=bool))
+
+
 def test_terminal_columns_are_not_excluded():
-    """``in_core`` / the terminal-column exclusion are deleted from this path.
-    A 5' extension block is a length difference, which is the point."""
+    """``candidate_columns`` excludes nothing by position or provenance on its
+    own: a 5' extension block is admitted here. The M-step rules terminal
+    extensions out by passing ``eligible`` (see the test above)."""
     rng = np.random.default_rng(53)
     truth = _rand(rng, 400)
     frame = truth[60:]
