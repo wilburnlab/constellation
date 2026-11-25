@@ -654,9 +654,11 @@ def test_a_hub_does_not_join_two_split_siblings():
     # --merge-siblings switches the kin guard off by passing no origin.
     assert _survivors(rows, reads, length, origin=None) == [2, 2, 2]
     # Siblings the merge marks kin-exempt (the same: no edits, ends within
-    # the tolerance) were separated by nothing, so they merge.
-    twins = [(2, 0, 0, 0, True), (2, 1, 0, 0, True)]
+    # the tolerance) were separated by nothing, so they merge — when they are
+    # exempt with each other, not only with the hub.
+    twins = [(2, 0, 0, 0, True), (2, 1, 0, 0, True), (0, 1, 0, 0, True)]
     assert _survivors(twins, reads, length, origin=origin) == [2, 2, 2]
+    assert _survivors(twins[:2], reads, length, origin=origin) == [2, 1, 2]
 
 
 def test_members_on_opposite_sides_of_the_hub_are_too_far_apart():

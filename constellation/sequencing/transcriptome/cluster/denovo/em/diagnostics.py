@@ -661,13 +661,16 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                     f"become the same as another (equivalent, no edits) were "
                     f"folded into it, its consensus kept"
                     + (
-                        f"; {final['n_same_refused_extent']:,} stayed apart "
-                        f"because the other's ends refuse their reads"
+                        f"; {final['n_same_refused_extent']:,} proposed folds "
+                        f"were refused because the survivor's ends refuse a read "
+                        f"of the other, and grouped again without them"
                         if final.get("n_same_refused_extent")
                         else ""
                     )
                     + f"; {final.get('n_same_remaining', 0):,} same pairs remain "
-                    f"(their union would stretch past the end tolerance)."
+                    f"apart (the extent rule, or a group guard — the group's "
+                    f"ends, or kin that are not the same as each other — "
+                    f"refuses joining them)."
                 )
             elif str(final.get("same_fold", "")).startswith("failed"):
                 rebuilt += f" The closing fold did not run: {final['same_fold']}."

@@ -214,11 +214,33 @@ def test_a_claimant_refuses_its_own_sibling():
 
 
 def test_byte_identical_siblings_merge_despite_sharing_an_origin():
-    """Reads cannot tell them apart, so merging them moves nothing."""
+    """Reads cannot tell them apart, so merging them moves nothing. Byte
+    identity is transitive, so the graph writes the siblings' own edge too
+    (every pair of a byte-identical class), and the guard reads it."""
     res = _cover(
-        3, [B, A, C], HUB, origin=[PARENT, OTHER_PARENT, PARENT], identical=[1, 1]
+        3,
+        [B, A, C],
+        HUB + [(A, C, 0, 0)],
+        origin=[PARENT, OTHER_PARENT, PARENT],
+        identical=[1, 1, 1],
     )
     assert _groups(res) == [[A, B, C]]
+
+
+def test_kin_the_same_as_the_claimant_must_be_the_same_as_each_other():
+    """Sameness is not transitive: a claimant without the siblings' first 20
+    nt is the same as both, while the siblings differ by two edits inside
+    those 20 nt — their own edge is not exempt, or not there at all (kin an
+    edit apart are not mergeable). One sibling joins; the other stays."""
+    for kin_edge in ([], [(A, C, 0, 0)]):
+        res = _cover(
+            3,
+            [B, A, C],
+            [(B, A, 20, 0), (B, C, 20, 0)] + kin_edge,
+            origin=[PARENT, OTHER_PARENT, PARENT],
+            identical=[1, 1] + [0] * len(kin_edge),
+        )
+        assert _groups(res) == [[A, B], [C]]
 
 
 @pytest.mark.parametrize("identical", [[True, False], [False, True]])
@@ -238,10 +260,20 @@ def test_a_claimant_takes_its_own_sibling_when_byte_identical():
 def test_a_third_twin_joins_two_already_merged():
     """The exemption is a property of the whole kin set, not of its first pair."""
     edges = [(0, 1, 0, 0), (0, 2, 0, 0), (0, 3, 0, 0)]
+    among = [(1, 2, 0, 0), (1, 3, 0, 0), (2, 3, 0, 0)]
     origin = [OTHER_PARENT, PARENT, PARENT, PARENT]
-    res = _cover(4, [0, 1, 2, 3], edges, origin=origin, identical=[1, 1, 1])
+    res = _cover(
+        4, [0, 1, 2, 3], edges + among, origin=origin, identical=[1, 1, 1, 1, 1, 1]
+    )
     assert _groups(res) == [[0, 1, 2, 3]]
-    res = _cover(4, [0, 1, 2, 3], edges, origin=origin, identical=[1, 1, 0])
+    res = _cover(
+        4, [0, 1, 2, 3], edges + among, origin=origin, identical=[1, 1, 0, 1, 0, 0]
+    )
+    assert _groups(res) == [[0, 1, 2], [3]]
+    # Each pair of the kin set, not only each against the claimant.
+    res = _cover(
+        4, [0, 1, 2, 3], edges + among, origin=origin, identical=[1, 1, 1, 1, 0, 1]
+    )
     assert _groups(res) == [[0, 1, 2], [3]]
 
 

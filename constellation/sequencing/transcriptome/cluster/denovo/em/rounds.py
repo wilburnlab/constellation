@@ -2134,6 +2134,66 @@ def _final_graph_and_merge(
 FOLDED_FINAL = "folded_final.parquet"
 
 
+def _select_same_folds(
+    n: int,
+    pairs: dict,
+    n_reads: np.ndarray,
+    seq_len: np.ndarray,
+    *,
+    tol_5p: int,
+    tol_3p: int,
+    origin: np.ndarray | None,
+    refuses,
+) -> tuple[np.ndarray, int]:
+    """The closing fold's groups, with read-level eligibility settled first.
+
+    ``pairs`` are same pairs by row (``mergeable_pairs``); ``refuses(absorbed,
+    into)`` answers, per pair of rows, whether ``into``'s ends refuse some
+    read of ``absorbed``. The pairs are grouped as the merge groups them
+    (deepest first, the group's ends within the tolerance, kin by the
+    predicate's rule); any absorption refused for extent removes its edge
+    and the grouping is made again, until none is refused. Removing a member
+    after the grouping instead would leave the neighbours it had crowded out
+    of the group's end allowance apart for no reason (Codex's review,
+    2026-11-25). Each (absorbed, survivor) pair is checked once; every pass
+    removes an edge, so the loop ends. Returns ``(survivor, n_refused)``.
+    """
+    a = np.asarray(pairs["src_row"], dtype=np.int64)
+    b = np.asarray(pairs["dst_row"], dtype=np.int64)
+    rows = np.arange(n, dtype=np.int64)
+    allowed = np.ones(a.shape[0], dtype=bool)
+    verdict: dict[tuple[int, int], bool] = {}
+    while True:
+        survivor = rf.select_merges(
+            n,
+            a[allowed],
+            b[allowed],
+            np.asarray(pairs["off_5p"], dtype=np.int64)[allowed],
+            np.asarray(pairs["off_3p"], dtype=np.int64)[allowed],
+            n_reads,
+            seq_len,
+            tol_5p=tol_5p,
+            tol_3p=tol_3p,
+            kin_exempt=np.asarray(pairs["kin_exempt"], dtype=bool)[allowed],
+            origin=origin,
+            prefer="support",
+        )
+        joined = [(int(x), int(survivor[x])) for x in np.flatnonzero(survivor != rows)]
+        todo = [p for p in joined if p not in verdict]
+        if todo:
+            got = refuses(
+                np.array([p[0] for p in todo], dtype=np.int64),
+                np.array([p[1] for p in todo], dtype=np.int64),
+            )
+            verdict.update(zip(todo, np.asarray(got, dtype=bool).tolist()))
+        bad = [min(p) * n + max(p) for p in joined if verdict[p]]
+        if not bad:
+            return survivor, int(sum(verdict.values()))
+        allowed &= ~np.isin(
+            np.minimum(a, b) * n + np.maximum(a, b), np.asarray(bad, dtype=np.int64)
+        )
+
+
 def _fold_same_final(
     rd: Path,
     nodes: pa.Table,
@@ -2178,41 +2238,43 @@ def _fold_same_final(
         log(f"final output: relating the clusters failed ({final['same_fold']})")
         return nodes, membership, keep, rf.MERGED_TABLE.empty_table()
     pred = params.merge_predicate()
+    # Exact and mergeable: the stored verdict is the run's predicate, so this
+    # reads only rows that can fold, not every exact `contained` edge.
     pairs = gr.mergeable_pairs(
-        pq.read_table(edges_path, filters=[("n_edits", "==", 0)]), pred, exact_only=True
+        pq.read_table(
+            edges_path, filters=[("n_edits", "==", 0), ("mergeable", "==", True)]
+        ),
+        pred,
+        exact_only=True,
     )
     n = nodes.num_rows
     rows = np.arange(n, dtype=np.int64)
     n_reads = nodes.column("n_reads").to_numpy(zero_copy_only=False).astype(np.int64)
     seq_len = pc.utf8_length(nodes.column("consensus")).to_numpy(zero_copy_only=False)
-    survivor = rf.select_merges(
+
+    def refuses(absorbed: np.ndarray, into: np.ndarray) -> np.ndarray:
+        return extent_refusals(
+            nodes,
+            membership,
+            absorbed,
+            into,
+            str(corpus_path),
+            identity_floor=params.p_floor,
+            quality_scale=params.p_floor_quality_scale,
+            end_tolerance=params.end_tolerance,
+            threads=params.threads,
+        )
+
+    survivor, n_refused = _select_same_folds(
         n,
-        pairs["src_row"],
-        pairs["dst_row"],
-        pairs["off_5p"],
-        pairs["off_3p"],
+        pairs,
         n_reads,
         seq_len,
         tol_5p=pred.tol_5p,
         tol_3p=pred.tol_3p,
-        kin_exempt=pairs["kin_exempt"],
         origin=None if pred.merge_siblings else export["origin"],
-        prefer="support",
+        refuses=refuses,
     )
-    absorbed = np.flatnonzero(survivor != rows)
-    refused = extent_refusals(
-        nodes,
-        membership,
-        absorbed,
-        survivor[absorbed],
-        str(corpus_path),
-        params=params.mstep,
-        identity_floor=params.p_floor,
-        quality_scale=params.p_floor_quality_scale,
-        end_tolerance=params.end_tolerance,
-        threads=params.threads,
-    )
-    survivor[absorbed[refused]] = absorbed[refused]
     folded = rf.merged_table(
         export["ids"],
         survivor,
@@ -2242,7 +2304,7 @@ def _fold_same_final(
         same_fold="ok",
         n_same_pairs=int(pairs["src_row"].shape[0]),
         n_same_folded=int(n_folded),
-        n_same_refused_extent=int(refused.sum()),
+        n_same_refused_extent=int(n_refused),
         n_same_remaining=int(still.sum()),
     )
     if n_folded:
@@ -2250,8 +2312,8 @@ def _fold_same_final(
             f"final output: folded {n_folded:,} cluster(s) into another they "
             f"had become the same as"
             + (
-                f" ({int(refused.sum()):,} kept apart for their reads' extent)"
-                if refused.any()
+                f" ({int(n_refused):,} pair(s) refused for their reads' extent)"
+                if n_refused
                 else ""
             )
         )

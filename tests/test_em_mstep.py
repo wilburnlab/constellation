@@ -701,11 +701,12 @@ def test_a_template_with_no_same_children_is_emitted_as_before():
 
 
 class _Child:
-    """The two fields the sameness test reads, on a plan with no gaps."""
+    """The fields the sameness test reads, on a plan with no gaps."""
 
     def __init__(self, codes: np.ndarray):
         self.winner = codes
         self.frame_of_cons = np.arange(codes.shape[0])
+        self.consensus = "".join("ACGT"[int(c)] for c in codes)
 
 
 def test_sameness_is_a_tolerance_and_does_not_chain():
@@ -762,3 +763,73 @@ def test_a_run_recorded_before_the_fold_replays_without_it() -> None:
     narrowed = EmParams(merge_tol_5p=10)
     assert (narrowed.mstep.same_tol_5p, narrowed.mstep.same_tol_3p) == (10, 30)
     assert EmParams(end_tolerance=20).mstep.same_tol_3p == 20
+
+
+def test_children_with_one_sequence_in_different_columns_are_the_same():
+    """Every read is the same molecule, one A short of a 5-A run. Seventy
+    alignments put the deletion at the run's first column and thirty at its
+    last: two co-optimal placements, two anticorrelated columns, a split —
+    and two children that emit the same sequence. Sameness is decided on the
+    sequence, not the columns (Codex's review, 2026-11-25)."""
+    rng = np.random.default_rng(107)
+    left, right = _flank(rng, 300), _flank(rng, 295)
+    left = left[:-1] + ("C" if left[-1] == "A" else left[-1])
+    right = ("G" if right[0] == "A" else right[0]) + right[1:]
+    frame = left + "AAAAA" + right
+    read = left + "AAAA" + right
+    first = f"300M1D{len(frame) - 301}M"
+    last = f"304M1D{len(frame) - 305}M"
+    members = [_at(frame, read, 0, i, cigar=first) for i in range(70)] + [
+        _at(frame, read, 0, 70 + i, cigar=last) for i in range(30)
+    ]
+    apart = refine_template(frame, members, fold_same=False)
+    assert [n.n_reads for n in apart] == [70, 30]
+    assert apart[0].consensus == apart[1].consensus == read
+    folded = refine_template(frame, members)
+    assert [n.n_reads for n in folded] == [100]
+    assert folded[0].consensus == read
+    assert folded[0].stats["n_folded_same"] == 1
+
+
+def test_a_child_related_to_none_does_not_change_whether_others_fold():
+    """300 and 273 nt, 27 apart: the same, at the shorter's tolerance (27).
+    A 268-nt child related to neither must not lower it."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        _same_groups,
+    )
+
+    rng = np.random.default_rng(11)
+    plan = _Child(rng.integers(0, 4, 300).astype(np.int8))
+    unrelated = _Child(rng.integers(0, 4, 268).astype(np.int8))
+    kw = dict(tol_5p=30, tol_3p=30, short_tol_div=10)
+    alone = [(plan, 0, 300), (plan, 27, 300)]
+    assert _same_groups(alone, **kw).tolist() == [0, 0]
+    for built in (alone + [(unrelated, 0, 268)], [(unrelated, 0, 268)] + alone):
+        head = _same_groups(built, **kw).tolist()
+        pair = [i for i, b in enumerate(built) if b[0] is plan]
+        lone = next(i for i, b in enumerate(built) if b[0] is unrelated)
+        assert head[pair[0]] == head[pair[1]] == pair[0]
+        assert head[lone] == lone
+
+
+def test_a_group_holds_every_pair_to_sameness():
+    """A child lacking the first 20 nt is the same as two full-length ones
+    that differ inside those 20 nt; they are not the same as each other. It
+    takes one, never both."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        _same_groups,
+    )
+
+    rng = np.random.default_rng(13)
+    codes = rng.integers(0, 4, 900).astype(np.int8)
+    other = codes.copy()
+    other[[5, 10]] = (other[[5, 10]] + 1) % 4
+    short, full, variant = (_Child(codes), 20, 900), (_Child(codes), 0, 900), (
+        _Child(other),
+        0,
+        900,
+    )
+    head = _same_groups(
+        [short, full, variant], tol_5p=30, tol_3p=30, short_tol_div=10
+    ).tolist()
+    assert head == [0, 0, 2]

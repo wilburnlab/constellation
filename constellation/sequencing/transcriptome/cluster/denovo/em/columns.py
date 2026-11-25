@@ -396,9 +396,15 @@ def candidate_columns(
     """Admit columns for covariance testing.
 
     ``eligible`` (``(F,)`` bool, optional) rules columns out on both routes
-    before anything is tested: an ineligible column is not in the
-    Benjamini–Hochberg family, so excluding it changes no other column's
-    multiplicity correction. The count of columns either route would have
+    before anything is tested, so the eligible columns ARE the
+    Benjamini–Hochberg family. Excluding a column therefore changes the
+    correction every other column is judged under, and since BH is step-up,
+    a marginal column that passed among strong ineligible ones may not pass
+    without them: on the Nov2026 run, Prm2 ``…4916``'s linked pair (p 0.0043
+    and 0.0054) passed only because eight extension columns at p ≈ 0 ranked
+    ahead of it, and is not a candidate in the eligible family (the PI's
+    choice, 2026-11-25: candidacy should not depend on how ragged a
+    template's ends are). The count of columns either route would have
     admitted is ``n_excluded``.
 
     **Allelic route** — all three of: ``minor_frac ≥ f_min``,

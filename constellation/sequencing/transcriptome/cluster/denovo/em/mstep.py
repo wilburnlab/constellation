@@ -343,21 +343,25 @@ def same_children(
     """The pairs of children the template graph would call the same.
 
     ``built[k]`` is ``(cres, lo, hi)``: child ``k`` emits
-    ``cres.consensus[lo:hi]``, and every child is on ONE column plan, so frame
-    column ``c`` is the same position in each. Two children are the same when
-    their consensus calls (``winner``) agree on every column both emit and
-    neither reaches beyond the other at either end by more than the graph's
-    tolerance for the shorter (``min(tol, len // short_tol_div)``,
-    :func:`~.graph.effective_tolerance`): the graph's ``equivalent`` relation
-    with no edits, decided on the shared plan exactly, with no alignment.
+    ``cres.consensus[lo:hi]``, and every child is on ONE column plan. Two
+    children are the same when their emitted SEQUENCES agree wherever both
+    reach, and neither reaches beyond the other at either end by more than
+    the graph's tolerance for the shorter (``min(tol, len //
+    short_tol_div)``, :func:`~.graph.effective_tolerance`): the graph's
+    ``equivalent`` relation with no edits.
 
-    Returns ``(a, b, off_5p, off_3p)``: the pairs, and how many consensus
-    bases ``b`` reaches beyond ``a`` at each end (negative: ``a`` beyond
-    ``b``), the convention :func:`~..cluster_graph.guarded_set_cover` reads.
+    The plan says only where each child starts: how many bases the earlier
+    one emits before the later one's first column is its 5' reach. From
+    there the two strings are compared base for base — not their columns,
+    since two co-optimal placements of a deletion in a homopolymer are
+    different columns and the same sequence (Codex's review, 2026-11-25).
+
+    Returns ``(a, b, off_5p, off_3p)``: the pairs, and how many bases ``b``
+    reaches beyond ``a`` at each end (negative: ``a`` beyond ``b``).
     """
     spans = [_frame_span(c, lo, hi) for c, lo, hi in built]
     winners = [np.asarray(c.winner) for c, _lo, _hi in built]
-    lengths = [hi - lo for _c, lo, hi in built]
+    seqs = [c.consensus[lo:hi] for c, lo, hi in built]
 
     def bases(k: int, x: int, y: int) -> int:
         return int((winners[k][x:y] != _WINNER_GAP).sum())
@@ -368,12 +372,16 @@ def same_children(
             if spans[i] is None or spans[j] is None:
                 continue
             (si, ei), (sj, ej) = spans[i], spans[j]
-            s, e = max(si, sj), min(ei, ej)
-            if e <= s or not np.array_equal(winners[i][s:e], winners[j][s:e]):
+            if min(ei, ej) <= max(si, sj):
                 continue
             off_5p = bases(j, sj, si) if sj < si else -bases(i, si, sj)
-            off_3p = bases(j, ei, ej) if ej > ei else -bases(i, ej, ei)
-            cap = min(lengths[i], lengths[j]) // short_tol_div
+            # Each string from where the other begins.
+            ti, tj = seqs[i][max(0, -off_5p) :], seqs[j][max(0, off_5p) :]
+            n = min(len(ti), len(tj))
+            if n == 0 or ti[:n] != tj[:n]:
+                continue
+            off_3p = len(tj) - len(ti)
+            cap = min(len(seqs[i]), len(seqs[j])) // short_tol_div
             if abs(off_5p) <= min(tol_5p, cap) and abs(off_3p) <= min(tol_3p, cap):
                 for col, v in zip(out, (i, j, off_5p, off_3p)):
                     col.append(v)
@@ -389,35 +397,36 @@ def _same_groups(
 ) -> np.ndarray:
     """``head[k]``: the child that child ``k`` folds into (itself if none).
 
-    ``built`` is heaviest first. Grouped as the merge groups templates
-    (:func:`~..cluster_graph.guarded_set_cover`, the heaviest claiming
-    first), so a group's ends stay within the tolerance of each other:
-    sameness is a tolerance and does not chain, and children 25 nt apart
-    in pairs can lie 50 nt apart at the ends of a chain.
+    ``built`` is heaviest first. The heaviest child not yet in a group
+    starts one, and takes, heaviest first, each child that is the same as
+    EVERY member so far. Sameness is a tolerance and is not transitive: a
+    child lacking 20 nt at one end can be the same as two that differ inside
+    those 20 nt, and children 25 nt apart in pairs can lie 50 nt apart at
+    the ends of a chain. Holding every pair to it, each at its own length's
+    tolerance, keeps both out, and a child related to none of a group's
+    members cannot change whether they fold (Codex's review, 2026-11-25).
     """
-    from constellation.sequencing.transcriptome.cluster.denovo.cluster_graph import (
-        guarded_set_cover,
-    )
-
     n = len(built)
-    a, b, off_5p, off_3p = same_children(
+    head = np.arange(n, dtype=np.int64)
+    a, b, _, _ = same_children(
         built, tol_5p=tol_5p, tol_3p=tol_3p, short_tol_div=short_tol_div
     )
     if a.size == 0:
-        return np.arange(n, dtype=np.int64)
-    shortest = min(hi - lo for _c, lo, hi in built if hi > lo)
-    cap = shortest // short_tol_div
-    res = guarded_set_cover(
-        n,
-        np.arange(n, dtype=np.int64),
-        a,
-        b,
-        off_5p,
-        off_3p,
-        tol_5p=min(int(tol_5p), cap),
-        tol_3p=min(int(tol_3p), cap),
-    )
-    return res.centroid_uniq[res.cluster_of].astype(np.int64)
+        return head
+    same = np.zeros((n, n), dtype=bool)
+    same[a, b] = same[b, a] = True
+    grouped = np.zeros(n, dtype=bool)
+    for k in range(n):
+        if grouped[k]:
+            continue
+        grouped[k] = True
+        members = [k]
+        for m in range(k + 1, n):
+            if not grouped[m] and same[m, members].all():
+                members.append(m)
+                grouped[m] = True
+                head[m] = k
+    return head
 
 
 def _annotate_orf(node: RefinedTemplate, min_aa_length: int) -> RefinedTemplate:

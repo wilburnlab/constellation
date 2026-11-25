@@ -1003,6 +1003,25 @@ def test_a_split_whose_children_are_the_same_is_undone(tmp_path):
     assert final_old["n_merged"] == 0 and final_old["n_kin_refused_same"] == 1
 
 
+def test_a_shorter_template_does_not_rejoin_siblings_that_differ_beyond_it(tmp_path):
+    """Sameness is not transitive. Two siblings two edits apart within their
+    first 11 nt, and a deeper template from another lineage lacking their
+    first 20 nt: it is the same as each, and they are not the same as each
+    other. It takes one; the split between them stands (Codex's review of
+    the kin exemption, 2026-11-25)."""
+    a = _rnd(random.Random(13), 900)
+    other = _substituted(_substituted(a, 5), 10)
+    nodes = _nodes([(10, 0, 0, a, 8), (10, 0, 1, other, 6), (11, 1, 0, a[20:], 50)])
+    rd = _rd(tmp_path)
+    refined = _refine_and_merge(
+        rd, nodes, _store([10, 11]), 1, EmParams(threads=1, merge=True), _log
+    )
+    rel = _relations(rd / "graph" / "edges.parquet")
+    assert rel[(2, 0)] == ("equivalent", True) and rel[(2, 1)] == ("equivalent", True)
+    assert rel[(0, 1)] == ("equivalent", False), "kin, two edits apart"
+    assert refined.n_merged == 1 and refined.templates.num_rows == 2
+
+
 def test_the_hub_does_not_rejoin_the_split_a_round_later(hub, tmp_path):
     """The survivor stands for what it absorbed. Round 1: the hub takes one
     child of the split and is refused the other. Round 2: both survivors
@@ -1438,26 +1457,32 @@ def test_the_closing_fold_joins_what_the_rebuild_made_the_same(tmp_path, monkeyp
     assert final_off["same_fold"] == "off"
 
 
-def test_extent_refusals_answer_for_the_reads_not_the_consensus(tmp_path):
+def test_extent_refusals_answer_for_every_read_and_stop_at_the_first(
+    tmp_path, monkeypatch
+):
     """The fold's only question about a pair that is already the same: would
-    the survivor's ends refuse some read of the absorbed cluster? Reads 10
-    nt past a node that is itself 25 nt past the survivor are 35 nt past it."""
-    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
-        MStepParams,
-    )
-    from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
-        extent_refusals,
-    )
+    the survivor's ends refuse some read of the absorbed cluster? Reads 10 nt
+    past a node that is itself 25 nt past the survivor are 35 nt past it.
+    EVERY read answers, not the rebuild's member sample (which let an
+    outlier beyond the cap move unexamined, Codex's review 2026-11-25): one
+    such read among 40 refuses its node. The walk stops at the first
+    refusal."""
+    from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
+    from constellation.sequencing.transcriptome.cluster.denovo.em import rebuild as rb
 
     rng = random.Random(31)
     flank, body = _rnd(rng, 35), _rnd(rng, 800)
     survivor, near, far = body, flank[10:] + body, flank + body
-    nodes = _nodes([(10, 0, 0, survivor, 5), (11, 1, 0, near, 4), (12, 2, 0, near, 4)])
-    reads = [survivor] * 5 + [near] * 4 + [far] * 4
-    corpus = _corpus(tmp_path, nodes, mutate=None)
-    # The corpus as `_corpus` lays it out, with node 2's reads reaching on.
-    from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
-
+    nodes = _nodes(
+        [
+            (10, 0, 0, survivor, 5),
+            (11, 1, 0, near, 40),
+            (12, 2, 0, near, 4),
+            (13, 3, 0, near, 4),
+        ]
+    )
+    reads = [survivor] * 5 + [near] * 29 + [far] + [near] * 10 + [near] * 4 + [far] * 4
+    corpus = tmp_path / "reads.arrow"
     table = pa.table(
         {
             "read_id": pa.array([f"r{i}" for i in range(len(reads))], pa.string()),
@@ -1469,14 +1494,67 @@ def test_extent_refusals_answer_for_the_reads_not_the_consensus(tmp_path):
     )
     with pa.OSFile(str(corpus), "wb") as sink, pa.ipc.new_file(sink, _READS_SCHEMA) as w:
         w.write_table(table)
-    kw = dict(params=MStepParams(), identity_floor=0.97, threads=1)
-    got = extent_refusals(
-        nodes, _membership(nodes), [1, 2], [0, 0], str(corpus), end_tolerance=30, **kw
+    member = _membership(nodes)
+    kw = dict(identity_floor=0.97, threads=1)
+    got = rb.extent_refusals(
+        nodes, member, [1, 2, 3], [0, 0, 0], str(corpus), end_tolerance=30, **kw
     )
-    assert got.tolist() == [False, True]
-    assert extent_refusals(
-        nodes, _membership(nodes), [1, 2], [0, 0], str(corpus), end_tolerance=None, **kw
-    ).tolist() == [False, False]
+    assert got.tolist() == [True, False, True]
+    assert not rb.extent_refusals(
+        nodes, member, [1, 3], [0, 0], str(corpus), end_tolerance=None, **kw
+    ).any()
+
+    calls = []
+    real = rb.align_to_survivor
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(rb, "align_to_survivor", spy)
+    assert rb.extent_refusals(
+        nodes, member, [3], [0], str(corpus), end_tolerance=30, **kw
+    ).tolist() == [True]
+    assert len(calls) == 1, "its first read refused; nothing more is aligned"
+
+
+def test_a_refused_fold_does_not_crowd_out_one_that_is_allowed():
+    """Three clusters the same as the deepest: one 20 nt past its 5' end, one
+    15 nt short of it — 35 apart, so the group can hold only one, and the
+    better supported is proposed first. Its reads are refused for extent.
+    Removing it after the grouping left the other apart for nothing; the
+    grouping is made again without the refused pair (Codex's review,
+    2026-11-25)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _select_same_folds,
+    )
+
+    pairs = {
+        "src_row": np.array([0, 0]),
+        "dst_row": np.array([1, 2]),
+        "off_5p": np.array([20, -15]),
+        "off_3p": np.array([0, 0]),
+        "kin_exempt": np.array([True, True]),
+    }
+    asked = []
+
+    def refuses(absorbed, into):
+        asked.extend(zip(absorbed.tolist(), into.tolist()))
+        return absorbed == 1
+
+    survivor, n_refused = _select_same_folds(
+        3,
+        pairs,
+        np.array([50, 20, 10]),
+        np.array([900, 920, 885]),
+        tol_5p=30,
+        tol_3p=30,
+        origin=None,
+        refuses=refuses,
+    )
+    assert survivor.tolist() == [0, 1, 0]
+    assert n_refused == 1
+    assert asked == [(1, 0), (2, 0)], "each pair checked once"
 
 
 def test_the_rebuild_runs_in_a_pool_and_agrees_with_the_parent(tmp_path):
