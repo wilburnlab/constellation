@@ -704,6 +704,15 @@ class ClusterReplay:
     absorbed_node_template_id: np.ndarray | None = None
     absorbed_read_ids: pa.Array | None = None
     absorbed_quality: np.ndarray | None = None
+    #: Any kind: the reads of clusters the final stage's closing fold joined
+    #: to this one (they had become the same after the rebuild), the node
+    #: each came from, their ids and qualities — members of the cluster that
+    #: its consensus was not built from (``cluster_nodes.parquet``'s
+    #: ``folded_node_template_ids``).
+    folded_read_row: np.ndarray | None = None
+    folded_node_template_id: np.ndarray | None = None
+    folded_read_ids: pa.Array | None = None
+    folded_quality: np.ndarray | None = None
     verified: bool = False
     mismatch: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -834,6 +843,17 @@ def replay_cluster(
             )
     else:
         out = _replay_rebuilt(run_dir, row, is_ours, params, index)
+    folded = [int(i) for i in (row.get("folded_node_template_ids") or [])]
+    if folded:
+        # Joined after the consensus was final, by design: the replay
+        # re-creates the consensus without them and lists them beside it.
+        group = _group_reads(index, folded)
+        rows = group.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+        out.folded_read_row = rows
+        out.folded_node_template_id = group.column("node_template_id").to_numpy(
+            zero_copy_only=False
+        )
+        out.folded_read_ids, out.folded_quality = _read_ids_and_quality(run_dir, rows)
     out.verified = not out.mismatch
     if strict and out.mismatch:
         raise ReplayError(f"replay of cluster {cluster_id}: {out.mismatch[:3]}")

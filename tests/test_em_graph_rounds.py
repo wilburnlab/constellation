@@ -1275,8 +1275,10 @@ def test_cluster_edges_describe_the_clusters_that_were_written(tmp_path):
     rd = _rd(tmp_path)
     # Reads 40 nt past their node's consensus exist only without the extent
     # rule (since 2026-11-20 they are refused, 40 > 30); this is about
-    # relating what a rebuild wrote, so it runs with the rule off.
-    params = EmParams(threads=1, merge=True, end_tolerance=None)
+    # relating what a rebuild wrote, so it runs with the rule off — and
+    # without the closing fold, which would join the two clusters it is
+    # about (see test_the_closing_fold_joins_what_the_rebuild_made_the_same).
+    params = EmParams(threads=1, merge=True, end_tolerance=None, final_fold_same=False)
     out_nodes, _, final = _final_graph_and_merge(
         rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
     )
@@ -1352,7 +1354,9 @@ def test_a_failure_relating_the_final_clusters_writes_no_stale_edges(
 
     nodes, corpus, _ = _stale_edge_case(tmp_path)
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, merge=True, end_tolerance=None)  # see above
+    params = EmParams(
+        threads=1, merge=True, end_tolerance=None, final_fold_same=False
+    )  # see above
     out_nodes, _, final = _final_graph_and_merge(
         rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
     )
@@ -1372,6 +1376,107 @@ def test_a_failure_relating_the_final_clusters_writes_no_stale_edges(
     assert not list(out.glob("cluster_edges.parquet*"))
     assert "the join did not fit" in final["cluster_edges_error"]
     assert any("could not be written" in line for line in said)
+
+
+def test_the_closing_fold_joins_what_the_rebuild_made_the_same(tmp_path, monkeypatch):
+    """The stale-edge case: the final merge is one pass, and the rebuild that
+    follows makes its survivor byte-identical to a node the pass had left
+    apart. The final stage ends on a sameness check that changes no
+    consensus: the two are one cluster, the deeper one's consensus kept, and
+    the clusters are related once, before the outputs (2026-11-24)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        cluster_node_table,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        FOLDED_FINAL,
+        _cluster_edges,
+    )
+
+    nodes, corpus, long = _stale_edge_case(tmp_path)
+    member = _membership(nodes)
+    rd = _rd(tmp_path)
+    params = EmParams(threads=1, merge=True, end_tolerance=None)
+    built = _spy(monkeypatch)
+    out_nodes, mem, final = _final_graph_and_merge(
+        rd, nodes, member, 1, params, _log, corpus_path=corpus
+    )
+    assert built == [1, 1], "the round's graph, then the clusters as written"
+    assert final["same_fold"] == "ok" and final["n_same_folded"] == 1
+    assert final["n_same_remaining"] == 0 and final["n_same_refused_extent"] == 0
+    assert out_nodes.column("consensus").to_pylist() == [long]
+    assert out_nodes.column("n_reads").to_pylist() == [25]
+    assert mem.num_rows == member.num_rows
+    assert final["keep_rows"].tolist() == [0] and final["rebuilt_rows"].tolist() == [0]
+    folded = pq.read_table(rd / FOLDED_FINAL).to_pylist()
+    assert [(f["absorbed_n_reads"], f["delta_5p"]) for f in folded] == [(9, 0)]
+
+    table = cluster_node_table(
+        out_nodes,
+        round_index=1,
+        keep_rows=final["keep_rows"],
+        rebuilt_rows=final["rebuilt_rows"],
+        merged=pq.read_table(rd / "merged_final.parquet"),
+        folded=pq.read_table(rd / FOLDED_FINAL),
+    ).to_pylist()
+    assert table[0]["rebuilt"] and table[0]["n_absorbed"] == 1
+    assert table[0]["n_folded"] == 1
+    assert table[0]["folded_node_template_ids"] == [folded[0]["absorbed_template_id"]]
+
+    out = tmp_path / "run_out"
+    out.mkdir()
+    paths: dict = {}
+    counts = _cluster_edges(out, final, _clusters(out_nodes), paths, _log, rd=rd, params=params)
+    assert built == [1, 1], "the export reads the clusters as related, not again"
+    assert final["cluster_edges_source"] == "final_clusters"
+    assert counts["n_cluster_edges"] == 0 and counts["n_twin_clusters"] == 0
+
+    off = EmParams(threads=1, merge=True, end_tolerance=None, final_fold_same=False)
+    two, _, final_off = _final_graph_and_merge(
+        _rd(tmp_path / "off"), nodes, member, 1, off, _log, corpus_path=corpus
+    )
+    assert two.column("consensus").to_pylist() == [long, long]
+    assert final_off["same_fold"] == "off"
+
+
+def test_extent_refusals_answer_for_the_reads_not_the_consensus(tmp_path):
+    """The fold's only question about a pair that is already the same: would
+    the survivor's ends refuse some read of the absorbed cluster? Reads 10
+    nt past a node that is itself 25 nt past the survivor are 35 nt past it."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
+        extent_refusals,
+    )
+
+    rng = random.Random(31)
+    flank, body = _rnd(rng, 35), _rnd(rng, 800)
+    survivor, near, far = body, flank[10:] + body, flank + body
+    nodes = _nodes([(10, 0, 0, survivor, 5), (11, 1, 0, near, 4), (12, 2, 0, near, 4)])
+    reads = [survivor] * 5 + [near] * 4 + [far] * 4
+    corpus = _corpus(tmp_path, nodes, mutate=None)
+    # The corpus as `_corpus` lays it out, with node 2's reads reaching on.
+    from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
+
+    table = pa.table(
+        {
+            "read_id": pa.array([f"r{i}" for i in range(len(reads))], pa.string()),
+            "sequence": pa.array(reads, pa.large_string()),
+            "sample_id": pa.array(np.zeros(len(reads), np.int64)),
+            "dorado_quality": pa.array(np.full(len(reads), 30.0, np.float32)),
+        },
+        schema=_READS_SCHEMA,
+    )
+    with pa.OSFile(str(corpus), "wb") as sink, pa.ipc.new_file(sink, _READS_SCHEMA) as w:
+        w.write_table(table)
+    kw = dict(params=MStepParams(), identity_floor=0.97, threads=1)
+    got = extent_refusals(
+        nodes, _membership(nodes), [1, 2], [0, 0], str(corpus), end_tolerance=30, **kw
+    )
+    assert got.tolist() == [False, True]
+    assert extent_refusals(
+        nodes, _membership(nodes), [1, 2], [0, 0], str(corpus), end_tolerance=None, **kw
+    ).tolist() == [False, False]
 
 
 def test_the_rebuild_runs_in_a_pool_and_agrees_with_the_parent(tmp_path):

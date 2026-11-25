@@ -335,6 +335,32 @@ def _rebuild_one_or_error(row, consensus, read_rows, **kwargs):
         return row, None, 0, 1.0, f"{type(exc).__name__}: {exc}"[:500], np.empty(0, np.int64)
 
 
+def _imap(fn, calls: list, threads: int):
+    """``fn(*args, **kw)`` for each ``(args, kw)`` of ``calls``, in order: in
+    this process for one worker, else in a fork pool holding at most
+    ``workers * _IN_FLIGHT`` calls in flight. ``fn`` is module-level, so it
+    pickles by name; numpy, edlib and the consensus kernel only below the
+    fork."""
+    workers = max(1, min(int(threads), len(calls)))
+    if workers == 1:
+        for args, kw in calls:
+            yield fn(*args, **kw)
+        return
+    ctx = mp.get_context("fork")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        flying: deque = deque()
+        try:
+            for args, kw in calls:
+                flying.append(pool.submit(fn, *args, **kw))
+                if len(flying) >= workers * _IN_FLIGHT:
+                    yield flying.popleft().result()
+            while flying:
+                yield flying.popleft().result()
+        finally:
+            for future in flying:
+                future.cancel()
+
+
 def rebuild_survivors(
     nodes: pa.Table,
     membership: pa.Table,
@@ -406,33 +432,15 @@ def rebuild_survivors(
             counts["n_rebuilt"] += 1
             results[row] = rebuilt
 
-    workers = max(1, min(int(threads), len(tasks)))
-    if workers == 1:
-        for row, seq, member_rows, tid in tasks:
-            take(_rebuild_one_or_error(row, seq, member_rows, template_id=tid, **kwargs))
-    else:
-        ctx = mp.get_context("fork")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-            flying: deque = deque()
-            try:
-                for row, seq, member_rows, tid in tasks:
-                    flying.append(
-                        pool.submit(
-                            _rebuild_one_or_error,
-                            row,
-                            seq,
-                            member_rows,
-                            template_id=tid,
-                            **kwargs,
-                        )
-                    )
-                    if len(flying) >= workers * _IN_FLIGHT:
-                        take(flying.popleft().result())
-                while flying:
-                    take(flying.popleft().result())
-            finally:
-                for future in flying:
-                    future.cancel()
+    for outcome in _imap(
+        _rebuild_one_or_error,
+        [
+            ((row, seq, member_rows), {"template_id": tid, **kwargs})
+            for row, seq, member_rows, tid in tasks
+        ],
+        threads,
+    ):
+        take(outcome)
     say(
         f"final output: rebuilt {counts['n_rebuilt']:,} merged consensus"
         f"{'es' if counts['n_rebuilt'] != 1 else ''} from pooled reads"
@@ -468,4 +476,74 @@ def rebuild_survivors(
     return out.cast(nodes.schema), counts, rebuilt_rows
 
 
-__all__ = ["REBUILT_COLUMNS", "align_to_survivor", "rebuild_one", "rebuild_survivors"]
+def _refuses_for_extent(consensus: str, read_rows: np.ndarray, **kwargs) -> bool:
+    """Does ``consensus`` refuse any of ``read_rows`` for its extent alone?
+    A check that raises answers yes: the caller joins only what it could
+    check. Module-level so it pickles by name."""
+    refused: list = []
+    try:
+        rebuild_members(consensus, read_rows, refused_out=refused, **kwargs)
+    except Exception:  # noqa: BLE001 — undecided is refused, never joined
+        return True
+    return bool(refused)
+
+
+def extent_refusals(
+    nodes: pa.Table,
+    membership: pa.Table,
+    absorbed: np.ndarray,
+    survivor: np.ndarray,
+    corpus_path: str,
+    *,
+    params: MStepParams,
+    identity_floor: float,
+    quality_scale: float | None = None,
+    end_tolerance: int | None = None,
+    threads: int = 1,
+) -> np.ndarray:
+    """Which absorptions the extent rule refuses, building no consensus.
+
+    For each pair ``(absorbed[i], survivor[i])`` of node rows, the absorbed
+    node's reads are aligned to the survivor's consensus as the rebuild
+    aligns a pool (:func:`rebuild_members`: the run's floor, read by read,
+    and the member cap's sample), and the answer is whether any was refused
+    for its extent. The final stage's closing fold joins clusters that are
+    already the same (:func:`~.rounds._fold_same_final`), so the survivor's
+    consensus stands and only the reads' ends are in question: a node whose
+    reads reach more than the tolerance past the survivor's ends was never
+    of its extent. ``end_tolerance=None`` (no extent rule) refuses nothing.
+    """
+    absorbed = np.asarray(absorbed, dtype=np.int64)
+    survivor = np.asarray(survivor, dtype=np.int64)
+    out = np.zeros(absorbed.shape[0], dtype=bool)
+    if absorbed.shape[0] == 0 or end_tolerance is None:
+        return out
+    read_rows = _read_rows_of(nodes, membership, absorbed)
+    template_id = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
+    consensus = nodes.column("consensus")
+    kwargs = {
+        "corpus_path": str(corpus_path),
+        "params": params,
+        "identity_floor": float(identity_floor),
+        "quality_scale": quality_scale,
+        "end_tolerance": end_tolerance,
+    }
+    calls = [
+        (
+            (consensus[int(s)].as_py(), read_rows[i]),
+            {"template_id": int(template_id[a]), **kwargs},
+        )
+        for i, (a, s) in enumerate(zip(absorbed.tolist(), survivor.tolist()))
+    ]
+    for i, refused in enumerate(_imap(_refuses_for_extent, calls, threads)):
+        out[i] = bool(refused)
+    return out
+
+
+__all__ = [
+    "REBUILT_COLUMNS",
+    "align_to_survivor",
+    "extent_refusals",
+    "rebuild_one",
+    "rebuild_survivors",
+]

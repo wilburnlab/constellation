@@ -2171,6 +2171,8 @@ def cluster_edges(
     *,
     cluster_len: np.ndarray,
     cluster_n_reads: np.ndarray,
+    cluster_origin: np.ndarray | None = None,
+    predicate: MergePredicate | None = None,
 ) -> pa.Table:
     """The edges among the nodes that survive as clusters, keyed on cluster.
 
@@ -2190,6 +2192,11 @@ def cluster_edges(
     distinct clusters, and the template edges hold each pair of rows once
     and no row against itself. For the same reason every row is decided
     alone, and a file may be passed through one record batch at a time.
+
+    ``cluster_origin`` (each cluster's split origin) with ``predicate``
+    re-decides ``same_split_origin`` and ``mergeable`` for the clusters as
+    written: a survivor inherits the origins of what it absorbed and holds
+    its reads, and both columns as stored describe the rows before that.
     """
     keep_rows = _int64_column("keep_rows", keep_rows, None)
     k = keep_rows.shape[0]
@@ -2220,6 +2227,10 @@ def cluster_edges(
     for f in EDGE_FEATURE_FIELDS:
         if f.name not in c:
             c[f.name] = _column(edges, f.name)[kept]
+    if cluster_origin is not None and predicate is not None:
+        origin = _int64_column("cluster_origin", cluster_origin, k)
+        c["same_split_origin"] = (origin[src] >= 0) & (origin[src] == origin[dst])
+        c["mergeable"] = _mergeable_mask(c, predicate, False)[0]
     return _edge_table(c, CLUSTER_EDGE_TABLE)
 
 

@@ -655,6 +655,22 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                 )
             elif final.get("merge_applied") and final.get("n_merged"):
                 rebuilt = f" Survivors were not rebuilt: {final.get('rebuild')}."
+            if final.get("same_fold") == "ok":
+                rebuilt += (
+                    f" Then {final.get('n_same_folded', 0):,} clusters that had "
+                    f"become the same as another (equivalent, no edits) were "
+                    f"folded into it, its consensus kept"
+                    + (
+                        f"; {final['n_same_refused_extent']:,} stayed apart "
+                        f"because the other's ends refuse their reads"
+                        if final.get("n_same_refused_extent")
+                        else ""
+                    )
+                    + f"; {final.get('n_same_remaining', 0):,} same pairs remain "
+                    f"(their union would stretch past the end tolerance)."
+                )
+            elif str(final.get("same_fold", "")).startswith("failed"):
+                rebuilt += f" The closing fold did not run: {final['same_fold']}."
             if final.get("cluster_edges_source") == "final_clusters":
                 # The round's row above is the graph the merge READ; these
                 # counts are of the clusters as written.
