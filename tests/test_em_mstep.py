@@ -567,7 +567,7 @@ def test_molecule_end_variation_alone_does_not_split():
     assert nodes[0].n_reads == 100
     assert nodes[0].stats["n_excluded_extension"] > 0
 
-    before = refine_template(frame, members, candidate_extensions=True)
+    before = refine_template(frame, members, candidate_extensions=True, fold_same=False)
     assert len(before) > 1
     assert before[0].stats["n_excluded_extension"] == 0
 
@@ -633,3 +633,132 @@ def test_a_run_recorded_before_the_extension_rule_replays_with_extensions() -> N
     assert _mstep_params(old, MStepParams).candidate_extensions is True
     assert MStepParams().candidate_extensions is False
     assert MStepParams().kernel_kwargs()["candidate_extensions"] is False
+
+
+# ── a split never emits two children the graph would call the same ────
+
+
+def test_children_that_are_the_same_are_one_node():
+    """With extension columns admitted (the rule before), the ragged-ends
+    template splits on its ends — and every child emits the same sequence
+    over the span it shares with the others, its ends within 12 nt. The
+    graph would call them `equivalent` with no edits; they are one node."""
+    rng = np.random.default_rng(101)
+    frame = _rand(rng, 600)
+    members = _ragged_ends(rng, frame, 100)
+
+    apart = refine_template(frame, members, candidate_extensions=True, fold_same=False)
+    assert len(apart) > 1
+    folded = refine_template(frame, members, candidate_extensions=True)
+    assert len(folded) == 1
+    assert folded[0].n_reads == 100
+    assert folded[0].stats["n_folded_same"] == len(apart) - 1
+    assert folded[0].stats["n_nodes"] == 1
+    # The same under the median extent the loop runs with.
+    assert len(
+        refine_template(frame, members, candidate_extensions=True, node_extent="median")
+    ) == 1
+
+
+def test_same_children_fold_and_a_real_variant_stays_apart():
+    """Ends split three ways and an interior pair a fourth: the children that
+    differ only at their ends are one node, the carriers of the pair another."""
+    rng = np.random.default_rng(103)
+    frame = _rand(rng, 600)
+    alt = list(frame)
+    for p in (300, 305):
+        alt[p] = "A" if frame[p] != "A" else "C"
+    alt = "".join(alt)
+    members = _ragged_ends(rng, frame, 70) + _ragged_ends(
+        rng, frame, 30, first_id=70, body=alt
+    )
+    nodes = refine_template(frame, members, candidate_extensions=True)
+    assert sorted(n.n_reads for n in nodes) == [30, 70]
+    minor = min(nodes, key=lambda n: n.n_reads)
+    assert alt[290:320] in minor.consensus
+    assert [n.haplotype_id for n in nodes] == [0, 1]
+    assert nodes[0].n_reads == 70, "ids follow weight after the fold"
+
+
+def test_a_template_with_no_same_children_is_emitted_as_before():
+    """The fold is inert where nothing is the same: node for node, read for
+    read, the emission is the one before the rule."""
+    rng = np.random.default_rng(89)
+    frame = _rand(rng, 600)
+    alt = list(frame)
+    for p in (40, 45):
+        alt[p] = "A" if frame[p] != "A" else "C"
+    alt = "".join(alt)
+    members = [_at(frame, frame, 0, i) for i in range(70)] + [
+        _at(frame, alt, 0, 70 + i) for i in range(30)
+    ]
+    on = refine_template(frame, members)
+    off = refine_template(frame, members, fold_same=False)
+    assert [(n.haplotype_id, n.consensus, n.member_ids.tolist()) for n in on] == [
+        (n.haplotype_id, n.consensus, n.member_ids.tolist()) for n in off
+    ]
+    assert on[0].stats["n_folded_same"] == 0
+
+
+class _Child:
+    """The two fields the sameness test reads, on a plan with no gaps."""
+
+    def __init__(self, codes: np.ndarray):
+        self.winner = codes
+        self.frame_of_cons = np.arange(codes.shape[0])
+
+
+def test_sameness_is_a_tolerance_and_does_not_chain():
+    """Children starting 0, 25 and 50 nt in: each neighbouring pair is within
+    the 30-nt tolerance, the outer pair is not. Grouped as the merge groups
+    (the heaviest claiming, the group's ends held to the tolerance), the
+    middle child takes one neighbour and the other stays apart, never all
+    three — which union-find over the pairs would give."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        _same_groups,
+        same_children,
+    )
+
+    rng = np.random.default_rng(7)
+    codes = rng.integers(0, 4, 600).astype(np.int8)
+    plan = _Child(codes)
+    mid, early, late = (plan, 25, 600), (plan, 0, 600), (plan, 50, 600)
+    built = [mid, early, late]  # heaviest first
+    a, b, off_5p, _ = same_children(built, tol_5p=30, tol_3p=30, short_tol_div=10)
+    assert sorted(zip(a.tolist(), b.tolist())) == [(0, 1), (0, 2)]
+    assert dict(zip(b.tolist(), off_5p.tolist())) == {1: 25, 2: -25}
+    head = _same_groups(built, tol_5p=30, tol_3p=30, short_tol_div=10)
+    assert head.tolist() == [0, 0, 2]
+
+    # One base different inside the shared span: not the same.
+    other = codes.copy()
+    other[300] = (other[300] + 1) % 4
+    a, *_ = same_children(
+        [(plan, 0, 600), (_Child(other), 0, 600)], tol_5p=30, tol_3p=30, short_tol_div=10
+    )
+    assert a.size == 0
+    # A short template's tolerance is a tenth of it, as in the graph.
+    a, *_ = same_children(
+        [(plan, 0, 200), (plan, 25, 200)], tol_5p=30, tol_3p=30, short_tol_div=10
+    )
+    assert a.size == 0
+
+
+def test_a_run_recorded_before_the_fold_replays_without_it() -> None:
+    import dataclasses
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import MStepParams
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import _mstep_params
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import EmParams
+
+    old = {
+        k: v for k, v in dataclasses.asdict(MStepParams()).items()
+        if k not in ("fold_same", "same_tol_5p", "same_tol_3p", "same_short_tol_div")
+    }
+    assert _mstep_params(old, MStepParams).fold_same is False
+    assert MStepParams().fold_same is True
+    # The M-step judges sameness at the merge's tolerance.
+    assert EmParams().mstep.same_tol_5p == 30
+    narrowed = EmParams(merge_tol_5p=10)
+    assert (narrowed.mstep.same_tol_5p, narrowed.mstep.same_tol_3p) == (10, 30)
+    assert EmParams(end_tolerance=20).mstep.same_tol_3p == 20

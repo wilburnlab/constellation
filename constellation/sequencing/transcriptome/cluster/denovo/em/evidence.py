@@ -88,6 +88,9 @@ KERNEL_COUNTERS: tuple[str, ...] = (
     "n_signatures",
     "n_tuples_observed",
     "n_nodes",
+    # Surviving tuples folded into another because their children were the
+    # same (2026-11-24); `n_nodes` counts after the fold. Null before.
+    "n_folded_same",
 )
 
 MSTEP_TEMPLATE_TABLE: pa.Schema = pa.schema(

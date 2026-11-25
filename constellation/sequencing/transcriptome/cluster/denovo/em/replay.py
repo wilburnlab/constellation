@@ -331,6 +331,9 @@ def _mstep_params(d: dict, cls):
     if "candidate_extensions" in known and "candidate_extensions" not in d:
         # Recorded before 2026-11-24: terminal extension columns were candidates.
         d = {**d, "candidate_extensions": True}
+    if "fold_same" in known and "fold_same" not in d:
+        # Recorded before 2026-11-24: children were emitted however alike.
+        d = {**d, "fold_same": False}
     unknown = sorted(set(d) - known)
     if unknown:
         raise ReplayError(

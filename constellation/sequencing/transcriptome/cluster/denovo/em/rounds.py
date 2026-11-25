@@ -428,6 +428,17 @@ class EmParams:
                 "graph",
                 dataclasses.replace(self.graph, min_budget=int(self.merge_max_edits)),
             )
+        # What the M-step folds as "the same" is what the merge would treat
+        # as the same: the merge's end tolerances (the graph's unless
+        # narrowed), capped for short templates as the graph caps them.
+        pred = self.merge_predicate()
+        same = {
+            "same_tol_5p": int(pred.tol_5p),
+            "same_tol_3p": int(pred.tol_3p),
+            "same_short_tol_div": int(self.graph.short_tol_div),
+        }
+        if any(getattr(self.mstep, k) != v for k, v in same.items()):
+            object.__setattr__(self, "mstep", dataclasses.replace(self.mstep, **same))
 
     def round1_rule(self) -> str:
         """The seeder's round-1 ranking rule (`scheduler.ROUND1_RULES`).

@@ -169,6 +169,17 @@ class MStepParams:
     #: a reason to split. A run recorded before the field replays with them
     #: admitted.
     candidate_extensions: bool = False
+    #: Emit children the template graph would call the same (`equivalent`,
+    #: no edits) as ONE node (`mstep.same_children`). On (2026-11-24); a run
+    #: recorded before the field replays without it.
+    fold_same: bool = True
+    #: The tolerance "the same" is judged at: the merge's (the graph's unless
+    #: narrowed), capped at a `same_short_tol_div`-th of the shorter child,
+    #: as the graph caps it. Set from `EmParams` so the M-step and the merge
+    #: agree on what is the same; recorded so a replay judges as the run did.
+    same_tol_5p: int = 30
+    same_tol_3p: int = 30
+    same_short_tol_div: int = 10
 
     def kernel_kwargs(self) -> dict[str, Any]:
         return {
@@ -192,6 +203,10 @@ class MStepParams:
             "min_insertion_support": self.min_insertion_support,
             "node_extent": self.node_extent,
             "candidate_extensions": self.candidate_extensions,
+            "fold_same": self.fold_same,
+            "same_tol_5p": self.same_tol_5p,
+            "same_tol_3p": self.same_tol_3p,
+            "same_short_tol_div": self.same_short_tol_div,
         }
 
 

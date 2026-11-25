@@ -725,10 +725,11 @@ def section_mstep(em_dir: Path) -> ReportSection:
             prev_failed, prev_dir = set(), d
             continue
         cand = sig = None
-        n_ext = None
+        n_ext = n_fold = None
         failed_ids: set[int] = set()
         if t is not None and t.num_rows:
             n_ext = _counter_sum(t, "n_excluded_extension")
+            n_fold = _counter_sum(t, "n_folded_same")
             status = t.column("status").to_numpy(zero_copy_only=False)
             ids = t.column("template_id").to_numpy(zero_copy_only=False)
             failed_ids = set(
@@ -757,6 +758,7 @@ def section_mstep(em_dir: Path) -> ReportSection:
                 _q(cand),
                 _q(sig),
                 n_ext,
+                n_fold,
             )
         )
         if n_failed:
@@ -784,14 +786,14 @@ def section_mstep(em_dir: Path) -> ReportSection:
     lines = [
         "| round | templates | split | failed | no members | reads assigned "
         "| in nodes | candidates (p50/p90) | significant edges (p50/p90) "
-        "| end columns excluded |",
-        "|---:|---:|---:|---:|---:|---:|---:|---|---|---:|",
+        "| end columns excluded | same children folded |",
+        "|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
     ]
-    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig, n_ext in rows:
+    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig, n_ext, n_fold in rows:
         lines.append(
             f"| {r} | {_fmt(n)} | {_fmt(split)} | {_fmt(failed)} | {_fmt(nomem)} "
             f"| {_fmt(assigned)} | {_fmt(in_nodes)} | {cand} | {sig} "
-            f"| {_fmt(n_ext)} |"
+            f"| {_fmt(n_ext)} | {_fmt(n_fold)} |"
         )
     body = "\n".join(lines) + (
         "\n\nCandidates and edges are over the templates that had any. "
@@ -800,7 +802,9 @@ def section_mstep(em_dir: Path) -> ReportSection:
         "leaving the round. *End columns excluded*: terminal extension "
         "columns a route would have admitted, which are not candidates "
         "(how far reads run past a template's end is extent, not a reason "
-        "to split); blank for rounds recorded before the rule."
+        "to split). *Same children folded*: children of a split that the "
+        "template graph would call the same (equivalent, no edits), emitted "
+        "as one node. Both are blank for rounds recorded before the rules."
     )
     return ReportSection(title="M-step", body=body, flags=flags)
 
